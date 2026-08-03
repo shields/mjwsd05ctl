@@ -44,7 +44,17 @@ from mjwsd05ctl.transport import DeviceInfo
 
 @pytest.mark.parametrize(
     "command",
-    ["scan", "info", "activate", "flash", "bootstrap", "config", "read"],
+    [
+        "scan",
+        "info",
+        "activate",
+        "flash",
+        "bootstrap",
+        "config",
+        "comfort",
+        "reboot",
+        "read",
+    ],
 )
 def test_every_subcommand_parses(command: str) -> None:
     args = cli.build_parser().parse_args([command])
@@ -219,12 +229,18 @@ class FakeConnect:
     def __init__(self, *links: FakeLink) -> None:
         self._links = iter(links)
         self.calls: list[tuple[str | None, str | None]] = []
+        self.paired: list[bool] = []
 
     @contextlib.asynccontextmanager
     async def __call__(
-        self, target: str | None = None, *, adapter: str | None = None
+        self,
+        target: str | None = None,
+        *,
+        adapter: str | None = None,
+        pair: bool = False,
     ) -> AsyncIterator[FakeLink]:
         self.calls.append((target, adapter))
+        self.paired.append(pair)
         yield next(self._links)
 
 
@@ -373,14 +389,18 @@ class FakeOTAModule:
 
     def __init__(self) -> None:
         self.calls: list[tuple[Any, Any]] = []
+        self.hardware_ids: list[int | None] = []
 
     async def update(
         self,
         link: Any,
         image: Any,
+        *,
+        hardware_id: int | None = None,
         progress: Callable[[int, int], None] | None = None,
     ) -> None:
         self.calls.append((link, image))
+        self.hardware_ids.append(hardware_id)
         if progress is not None:
             progress(4, 8)
 
@@ -397,19 +417,35 @@ class FakeFirmwareModule:
         return self.image
 
 
+COMFORT = {
+    "temperature_min": 21.0,
+    "temperature_max": 26.0,
+    "humidity_min": 30.0,
+    "humidity_max": 60.0,
+}
+
+
 def make_config_module(
-    cfg: dict[str, Any], *, set_time_error: Error | None = None
+    cfg: dict[str, Any],
+    *,
+    set_time_error: Error | None = None,
+    comfort: dict[str, float] | None = None,
+    bindkey: bytes | None = b"\x00" * 16,
 ) -> SimpleNamespace:
     """Stand in for `config`: an in-memory settings dict behind a fake session."""
     sessions: list[Any] = []
+    zone = dict(comfort or COMFORT)
 
     class FakeConfigSession:
         def __init__(self, link: Any) -> None:
             self.link = link
             self.cfg = dict(cfg)
+            self.zone = dict(zone)
             self.opened = False
             self.reset_called = False
+            self.rebooted = False
             self.written: list[dict[str, Any]] = []
+            self.comfort_writes: list[dict[str, float]] = []
             self.time_requested = False
             self.bindkey_writes: list[bytes] = []
             self.mi_keys_writes: list[tuple[bytes, bytes]] = []
@@ -444,6 +480,28 @@ def make_config_module(
         async def set_mi_keys(self, token: bytes, bindkey: bytes) -> None:
             self.mi_keys_writes.append((token, bindkey))
 
+        async def mac_address(self) -> config.MacAddresses:
+            return config.MacAddresses(
+                public="A4:C1:38:11:22:33", random_static="C0:44:55:11:22:33"
+            )
+
+        async def device_id(self) -> SimpleNamespace:
+            return SimpleNamespace(sw_version=0x0058)
+
+        async def get_bindkey(self) -> bytes | None:
+            return bindkey
+
+        async def comfort(self) -> dict[str, float]:
+            return dict(self.zone)
+
+        async def write_comfort(self, updated: dict[str, float]) -> dict[str, float]:
+            self.comfort_writes.append(dict(updated))
+            self.zone = dict(updated)
+            return dict(self.zone)
+
+        async def reboot(self) -> None:
+            self.rebooted = True
+
     def to_dict(current: dict[str, Any]) -> dict[str, Any]:
         return dict(current)
 
@@ -464,6 +522,16 @@ def make_config_module(
     def validate(settings: dict[str, str]) -> dict[str, str]:
         return dict(settings)
 
+    def comfort_to_dict(current: dict[str, float]) -> dict[str, float]:
+        return dict(current)
+
+    def apply_comfort(
+        current: dict[str, float], settings: dict[str, str]
+    ) -> dict[str, float]:
+        for name, value in settings.items():
+            current[name] = float(value)
+        return current
+
     return SimpleNamespace(
         Session=FakeConfigSession,
         sessions=sessions,
@@ -471,6 +539,13 @@ def make_config_module(
         derived=derived,
         apply=apply,
         validate=validate,
+        comfort_to_dict=comfort_to_dict,
+        apply_comfort=apply_comfort,
+        validate_comfort=validate,
+        software_version=lambda identity: (
+            f"{identity.sw_version >> 4 & 0xF}.{identity.sw_version & 0x0F}"
+        ),
+        MacAddresses=config.MacAddresses,
     )
 
 
@@ -633,6 +708,44 @@ def test_info_json_includes_config_and_derived_for_custom_firmware(
     assert payload["derived"] == {"advertising_interval_ms": 2000.0}
 
 
+def test_info_reports_what_only_the_device_can_tell_us(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # CoreBluetooth hands out a per-host UUID instead of an address, so asking
+    # the device for its own is the only way to learn it on macOS.
+    link = FakeLink(address="70A1B2C3-0000-4000-8000-000000000000")
+    link.services = frozenset({CUSTOM_SERVICE})
+    monkeypatch.setattr(cli, "connect", FakeConnect(link))
+    monkeypatch.setattr(
+        cli, "config_module", make_config_module({"advertising_interval": 32})
+    )
+
+    assert cli.main(["--json", "info"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mac_address"] == "A4:C1:38:11:22:33"
+    assert payload["random_mac_address"] == "C0:44:55:11:22:33"
+    assert payload["firmware_version"] == "5.8"
+    assert payload["bindkey_stored"] is True
+    assert payload["comfort"] == COMFORT
+
+
+def test_info_says_when_no_bind_key_is_stored(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    link = FakeLink(services=frozenset({CUSTOM_SERVICE}))
+    monkeypatch.setattr(cli, "connect", FakeConnect(link))
+    monkeypatch.setattr(
+        cli,
+        "config_module",
+        make_config_module({"advertising_interval": 32}, bindkey=None),
+    )
+
+    assert cli.main(["--json", "info"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["bindkey_stored"] is False
+
+
 def test_info_omits_config_for_stock_firmware(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -731,6 +844,9 @@ def test_flash_command_skips_activation_when_asked(
 
     assert fake_ota.calls == [(link, image)]
     assert fake_firmware.calls == [(HW_ID_CH, None)]
+    # The update needs the hardware id too: it decides how large an image the
+    # ordinary slot can take, and so whether the extended area has to be erased.
+    assert fake_ota.hardware_ids == [HW_ID_CH]
     assert capsys.readouterr().err == "\rFlashing:  50% (4/8 blocks)\n"
 
 
@@ -1061,6 +1177,154 @@ def test_config_set_bindkey_without_saved_keys_is_an_error(
     assert cli.main(["config", "--set-bindkey"]) == 1
 
     assert "no saved Xiaomi keys for this device" in capsys.readouterr().err
+
+
+# --- comfort ---------------------------------------------------------------
+
+
+def test_comfort_shows_the_band_in_degrees_and_per_cent(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "connect", FakeConnect(FakeLink()))
+    fake_config = make_config_module({}, comfort={**COMFORT, "temperature_min": 20.5})
+    monkeypatch.setattr(cli, "config_module", fake_config)
+
+    assert cli.main(["comfort"]) == 0
+
+    assert capsys.readouterr().out == (
+        "Comfortable between 20.5 and 26 °C, 30 and 60 %\n"
+    )
+    assert fake_config.sessions[0].comfort_writes == []
+
+
+def test_comfort_json_reports_every_limit(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "connect", FakeConnect(FakeLink()))
+    monkeypatch.setattr(cli, "config_module", make_config_module({}))
+
+    assert cli.main(["--json", "comfort"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == COMFORT
+
+
+def test_comfort_set_writes_only_the_named_limits(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "connect", FakeConnect(FakeLink()))
+    fake_config = make_config_module({})
+    monkeypatch.setattr(cli, "config_module", fake_config)
+
+    argv = ["--json", "comfort", "--set", "temperature_min=19"]
+    assert cli.main([*argv, "--set", "humidity_max=55"]) == 0
+
+    # The untouched limits come back from the device, not from the command line.
+    assert fake_config.sessions[0].comfort_writes == [
+        {
+            "temperature_min": 19.0,
+            "temperature_max": 26.0,
+            "humidity_min": 30.0,
+            "humidity_max": 55.0,
+        }
+    ]
+    assert json.loads(capsys.readouterr().out)["temperature_min"] == 19.0
+
+
+def test_a_bad_comfort_limit_is_caught_before_touching_hardware(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # No adapter is opened, so this can only have failed on the name itself.
+    assert cli.main(["comfort", "--set", "tempurature_min=19"]) == 1
+    assert "unknown comfort limit" in capsys.readouterr().err
+
+
+# --- reboot ----------------------------------------------------------------
+
+
+def test_reboot_asks_the_device_to_restart(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "connect", FakeConnect(FakeLink()))
+    fake_config = make_config_module({})
+    monkeypatch.setattr(cli, "config_module", fake_config)
+
+    assert cli.main(["reboot"]) == 0
+
+    assert fake_config.sessions[0].rebooted is True
+    assert "restarting" in capsys.readouterr().out
+
+
+def test_reboot_honours_the_json_flag_like_every_other_command(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A script that asks for JSON gets JSON from every command or from none of
+    # them; one that quietly prints a sentence breaks the caller's parser.
+    link = FakeLink(address="A4:C1:38:00:00:0A")
+    monkeypatch.setattr(cli, "connect", FakeConnect(link))
+    monkeypatch.setattr(cli, "config_module", make_config_module({}))
+
+    assert cli.main(["--json", "reboot"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "address": link.address,
+        "restarting": True,
+    }
+
+
+# --- pairing ---------------------------------------------------------------
+
+
+def test_no_command_bonds_with_the_device_by_default(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Bonding is unreliable on some stacks and buys nothing on firmware that
+    # has no PIN set, which is every device out of the box.
+    fake_connect = FakeConnect(FakeLink())
+    monkeypatch.setattr(cli, "connect", fake_connect)
+    monkeypatch.setattr(cli, "config_module", make_config_module({}))
+
+    assert cli.main(["reboot"]) == 0
+
+    capsys.readouterr()
+    assert fake_connect.paired == [False]
+
+
+def test_pin_bonds_with_the_device(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_connect = FakeConnect(FakeLink())
+    monkeypatch.setattr(cli, "connect", fake_connect)
+    monkeypatch.setattr(cli, "config_module", make_config_module({}))
+
+    assert cli.main(["--pin", "reboot"]) == 0
+
+    capsys.readouterr()
+    assert fake_connect.paired == [True]
+
+
+def test_pin_reaches_the_second_connection_bootstrap_makes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # `bootstrap` reconnects after the device reboots into its new firmware;
+    # that connection needs the option just as much as the first one.
+    first = FakeLink(services=frozenset({MI_AUTH_SERVICE, OTA_SERVICE}))
+    second = FakeLink(services=frozenset({CUSTOM_SERVICE}))
+    fake_connect = FakeConnect(first, second)
+    monkeypatch.setattr(cli, "connect", fake_connect)
+    monkeypatch.setattr(cli, "REBOOT_WAIT", 0.0)
+    monkeypatch.setattr(cli, "ota", FakeOTAModule())
+    monkeypatch.setattr(
+        cli, "firmware", FakeFirmwareModule(FirmwareImage("BTH_v58.bin", b"\xff" * 32))
+    )
+    factory, _ = make_miauth(KEYS)
+    monkeypatch.setattr(cli, "MiAuth", factory)
+    monkeypatch.setattr(cli, "Keystore", FakeKeystore())
+    monkeypatch.setattr(cli, "config_module", make_config_module({}))
+
+    assert cli.main(["--pin", "--keys", str(tmp_path / "k.json"), "bootstrap"]) == 0
+
+    capsys.readouterr()
+    assert fake_connect.paired == [True, True]
 
 
 # --- read --------------------------------------------------------------

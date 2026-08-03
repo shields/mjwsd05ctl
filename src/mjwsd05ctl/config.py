@@ -26,7 +26,16 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from construct import BitsInteger, BitStruct, Container, Flag, Int8ul, Int16ul, Struct
+from construct import (
+    BitsInteger,
+    BitStruct,
+    Container,
+    Flag,
+    Int8ul,
+    Int16sl,
+    Int16ul,
+    Struct,
+)
 
 from .constants import (
     CONFIG_VERSION,
@@ -97,6 +106,28 @@ DEV_ID = Struct(
     "services" / Int8ul[4],
 )
 
+# `scomfort_t` from src/app.h: the band the display's smiley reflects, stored in
+# hundredths of a degree and of a per cent. `lcd.c` compares readings against
+# these directly. Temperature is signed, humidity is not.
+COMFORT = Struct(
+    "temperature_min" / Int16sl,
+    "temperature_max" / Int16sl,
+    "humidity_min" / Int16ul,
+    "humidity_max" / Int16ul,
+)
+
+COMFORT_SIZE = 8
+COMFORT_SCALE = 100
+
+# `CMD_ID_DEV_MAC` answers with a length byte, the public address, and the two
+# bytes that differ in the random static address. Flash holds an address least
+# significant byte first, the reverse of how it is written down
+# (TelinkMiFlasher.html:1363); the random static one shares the public address's
+# first three bytes and always ends 0xC0 (`cmd_parser.c`).
+MAC_REPLY_SIZE = 8
+MAC_LEN = 6
+RANDOM_MAC_LAST_BYTE = 0xC0
+
 # Advertising interval is counted in units of 62.5 ms, LCD update in 50 ms, and
 # connection latency in 20 ms.
 ADV_INTERVAL_MS = 62.5
@@ -158,6 +189,42 @@ FIELDS: dict[str, FieldSpec] = {
     "hw_ver": FieldSpec(None, "hardware version", read_only=True),
     "averaging_measurements": FieldSpec(None, "measurements to average, 0 to disable"),
 }
+
+
+@dataclass(frozen=True, slots=True)
+class ComfortSpec:
+    """One edge of the comfort band, in the units a person would type.
+
+    The limits are what the firmware's 16-bit fields can hold rather than
+    anything the sensor could report, because the firmware stores whatever it
+    is given and the display compares against it unaltered.
+    """
+
+    help: str
+    unit: str
+    minimum: float
+    maximum: float
+
+
+COMFORT_FIELDS: dict[str, ComfortSpec] = {
+    "temperature_min": ComfortSpec(
+        "lowest comfortable temperature", "°C", -327.68, 327.67
+    ),
+    "temperature_max": ComfortSpec(
+        "highest comfortable temperature", "°C", -327.68, 327.67
+    ),
+    "humidity_min": ComfortSpec("lowest comfortable humidity", "%", 0.0, 655.35),
+    "humidity_max": ComfortSpec("highest comfortable humidity", "%", 0.0, 655.35),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class MacAddresses:
+    """The two addresses a device can advertise under."""
+
+    public: str
+    random_static: str
+
 
 _TRUE = frozenset({"1", "on", "true", "yes", "y"})
 _FALSE = frozenset({"0", "off", "false", "no", "n"})
@@ -237,6 +304,38 @@ class Session:
         response = await self.request(CommandId.DEV_ID)
         return DEV_ID.parse(bytes([CommandId.DEV_ID]) + response)
 
+    async def mac_address(self) -> MacAddresses:
+        """Read the addresses the device advertises under.
+
+        Worth asking the device even though we are already talking to it:
+        CoreBluetooth never discloses an address, so on macOS this is the only
+        way to learn one.
+        """
+        response = await self.request(CommandId.DEV_MAC)
+        if len(response) <= MAC_REPLY_SIZE or response[0] != MAC_REPLY_SIZE:
+            msg = f"device answered DEV_MAC with {len(response)} bytes"
+            raise ConfigError(msg)
+        stored = response[1 : 1 + MAC_REPLY_SIZE]
+        public = stored[:MAC_LEN]
+        random_static = bytes([*public[:3], stored[6], stored[7], RANDOM_MAC_LAST_BYTE])
+        return MacAddresses(
+            public=_format_mac(public), random_static=_format_mac(random_static)
+        )
+
+    async def comfort(self) -> Container[Any]:
+        """Read the comfort band."""
+        return _parse_comfort(await self.request(CommandId.COMFORT))
+
+    async def write_comfort(self, zone: Container[Any]) -> Container[Any]:
+        """Write the comfort band and return what the device reports afterwards.
+
+        The firmware saves the band to its EEPROM before answering, so the reply
+        is what it will use from now on.
+        """
+        return _parse_comfort(
+            await self.request(CommandId.COMFORT, COMFORT.build(zone))
+        )
+
     async def set_time(self, when: datetime | None = None) -> int:
         """Set the clock.
 
@@ -299,6 +398,33 @@ def _parse_config(response: bytes) -> Container[Any]:
     return CFG.parse(response[1 : 1 + CFG_SIZE])
 
 
+def _parse_comfort(response: bytes) -> Container[Any]:
+    if len(response) < COMFORT_SIZE:
+        msg = f"comfort reply is only {len(response)} bytes"
+        raise ConfigError(msg)
+    return COMFORT.parse(response[:COMFORT_SIZE])
+
+
+def _format_mac(stored: bytes) -> str:
+    """Render an address held in flash order the way it is written down."""
+    return ":".join(f"{byte:02X}" for byte in reversed(stored))
+
+
+def software_version(dev: Container[Any]) -> str:
+    """Render `dev_id_t.sw_version`, which is BCD in its low byte.
+
+    Only the low byte carries the version the firmware calls its own, which is
+    what `cfg.ver` is compared against throughout (TelinkMiFlasher.html:1163).
+    """
+    version = dev.sw_version & 0xFF
+    return f"{version >> 4}.{version & 0x0F}"
+
+
+def comfort_to_dict(zone: Container[Any]) -> dict[str, float]:
+    """Flatten a comfort band into degrees and per cent."""
+    return {name: zone[name] / COMFORT_SCALE for name in COMFORT_FIELDS}
+
+
 def to_dict(cfg: Container[Any]) -> dict[str, int | bool | str]:
     """Flatten a parsed config into plain values, naming enum members."""
     result: dict[str, int | bool | str] = {}
@@ -350,6 +476,60 @@ def apply(cfg: Container[Any], settings: dict[str, str]) -> Container[Any]:
     for name, value in validate(settings).items():
         _set(cfg, name, FIELDS[name], value)
     return cfg
+
+
+def validate_comfort(settings: dict[str, str]) -> dict[str, int]:
+    """Check comfort limits without a device, as `validate` does for settings."""
+    parsed: dict[str, int] = {}
+    for name, raw in settings.items():
+        spec = COMFORT_FIELDS.get(name)
+        if spec is None:
+            # Listed in declaration order, unlike `validate`'s two dozen sorted
+            # settings: these are two pairs, and reading them min-then-max says
+            # more than alphabetical would.
+            known = ", ".join(COMFORT_FIELDS)
+            msg = f"unknown comfort limit {name!r}; known limits are {known}"
+            raise ConfigError(msg)
+        parsed[name] = parse_comfort_value(name, spec, raw)
+    return parsed
+
+
+def apply_comfort(zone: Container[Any], settings: dict[str, str]) -> Container[Any]:
+    """Apply `name=value` limits to a comfort band read from the device."""
+    for name, value in validate_comfort(settings).items():
+        zone[name] = value
+    # Checked after merging rather than per value, because raising only one edge
+    # of a band the device already holds is what inverts it.
+    if (
+        zone.temperature_min > zone.temperature_max
+        or zone.humidity_min > zone.humidity_max
+    ):
+        msg = (
+            "the comfort band's lower limit would be above its upper limit, "
+            "which no reading can satisfy"
+        )
+        raise ConfigError(msg)
+    return zone
+
+
+def parse_comfort_value(name: str, spec: ComfortSpec, raw: str) -> int:
+    """Turn a command-line temperature or humidity into stored hundredths."""
+    try:
+        value = float(raw)
+    except ValueError:
+        msg = f"{name}: expected a number of {spec.unit}, got {raw!r}"
+        raise ConfigError(msg) from None
+    if not spec.minimum <= value <= spec.maximum:
+        msg = (
+            f"{name}: {value:g} is outside "
+            f"{spec.minimum:g}..{spec.maximum:g} {spec.unit}"
+        )
+        raise ConfigError(msg)
+    # Half-to-even, so 20.125 stores 20.12 rather than 20.13. Left alone
+    # deliberately: the tie is half a hundredth of a degree, the sensor
+    # resolves tenths, and the alternative is arithmetic nobody can check
+    # against the firmware.
+    return round(value * COMFORT_SCALE)
 
 
 def parse_value(name: str, spec: FieldSpec, raw: str) -> int:

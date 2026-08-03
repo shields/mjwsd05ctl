@@ -45,16 +45,30 @@ steps are also available:
 
 ```sh
 mjwsd05ctl scan                                  # find nearby devices
+mjwsd05ctl info --address <mac>                  # what the device reports
 mjwsd05ctl activate --address <mac>              # ECDH registration + login
 mjwsd05ctl flash --address <mac> --firmware BTH_v58.bin
 mjwsd05ctl config --address <mac>                # show current settings
 mjwsd05ctl config --address <mac> --set advertising_type=BTHome --set temp_F_or_C=0
+mjwsd05ctl comfort --address <mac>               # the band the smiley reflects
+mjwsd05ctl comfort --address <mac> --set temperature_min=19.5
+mjwsd05ctl reboot --address <mac>
 mjwsd05ctl read                                  # passive advertisement decode
 mjwsd05ctl read --mqtt mqtt://broker.local
 ```
 
 `read` never connects to anything: it decodes broadcast advertisements, so it
 scales to as many devices as are in range.
+
+`info` asks the device for its own Bluetooth address, which is worth having on
+macOS, where CoreBluetooth will not tell you what it is.
+
+Devices ship with no PIN and leave their characteristics unsecured, so nothing
+bonds by default. Once you have set a PIN, add `--pin` before the subcommand,
+such as `mjwsd05ctl --pin reboot --address <mac>`. Entering the code is BlueZ's
+business, not this tool's: it asks whichever Bluetooth agent the system has
+registered, so on a headless machine keep `bluetoothctl` open alongside with
+`agent on`, or pairing will fail with nothing having prompted you.
 
 ## Hardware
 

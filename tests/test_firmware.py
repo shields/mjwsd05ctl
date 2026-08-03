@@ -19,8 +19,14 @@ from pathlib import Path
 
 import pytest
 
-from mjwsd05ctl import firmware
-from mjwsd05ctl.constants import FIRMWARE_NAMES, HW_ID_CH, HW_ID_EN
+from mjwsd05ctl import firmware, ota
+from mjwsd05ctl.constants import (
+    FIRMWARE_NAMES,
+    HW_ID_CH,
+    HW_ID_EN,
+    MAX_BLE_OTA_SIZE_EN,
+    OTA_END_COMMAND,
+)
 from mjwsd05ctl.errors import FirmwareError
 
 
@@ -257,3 +263,13 @@ def test_released_images_validate(hardware_id: int) -> None:
     image = firmware.load(path)
     assert image.block_count > 1000
     assert len(image.data) % 16 == 0
+    # Both released images fit the ordinary slot with room to spare, which is
+    # why flashing one has never needed the extended area.
+    assert len(image.data) < MAX_BLE_OTA_SIZE_EN
+    # The terminator names the last block, so it is the one frame whose
+    # contents depend on the whole image rather than on 16 bytes of it.
+    last = image.block_count - 1
+    assert ota.end_frame(image.block_count) == OTA_END_COMMAND + struct.pack(
+        "<HH", last, ~last & 0xFFFF
+    )
+    assert ota.frame(0, image.block(0))[2:18] == image.data[:16]

@@ -21,7 +21,10 @@ from typing import TYPE_CHECKING
 
 from .constants import (
     CUSTOM_CHAR,
+    HW_ID_EN,
     MAX_BLE_OTA_SIZE,
+    MAX_BLE_OTA_SIZE_EN,
+    MAX_EXT_OTA_SIZE,
     MI_SPEED_CHAR,
     MI_SPEED_FAST,
     OTA_BLOCK_SIZE,
@@ -32,7 +35,7 @@ from .constants import (
     OTA_STATUS_INTERVAL,
     CommandId,
 )
-from .errors import OtaError
+from .errors import OTAError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -84,7 +87,7 @@ def frame(number: int, payload: bytes) -> bytes:
     """Build one 20-byte update frame: sequence, 16 bytes of data, CRC."""
     if len(payload) != OTA_BLOCK_SIZE:
         msg = f"block {number} has {len(payload)} bytes, expected {OTA_BLOCK_SIZE}"
-        raise OtaError(msg)
+        raise OTAError(msg)
     body = struct.pack("<H", number) + payload
     return body + struct.pack("<H", crc16_modbus(body))
 
@@ -101,10 +104,25 @@ def describe(status: int) -> str:
     return f"unknown status {status}"
 
 
+def ordinary_slot_size(link: Link, hardware_id: int | None = None) -> int:
+    """How large an image the plain update path can take on this device.
+
+    Stock firmware hands over its whole 208 KiB slot. Custom firmware is itself
+    living in low flash and keeps the update slot to 128 KiB — 112 KiB on the
+    international unit, whose hardware id the reference flasher singles out.
+    """
+    if not link.has_characteristic(CUSTOM_CHAR):
+        return MAX_EXT_OTA_SIZE
+    if hardware_id == HW_ID_EN:
+        return MAX_BLE_OTA_SIZE_EN
+    return MAX_BLE_OTA_SIZE
+
+
 async def update(
     link: Link,
     image: FirmwareImage,
     *,
+    hardware_id: int | None = None,
     progress: ProgressCallback | None = None,
 ) -> None:
     """Stream a firmware image to the device.
@@ -114,7 +132,26 @@ async def update(
     """
     if not link.has_characteristic(OTA_CHAR):
         msg = "device does not expose the Telink OTA characteristic"
-        raise OtaError(msg)
+        raise OTAError(msg)
+
+    limit = ordinary_slot_size(link, hardware_id)
+    if len(image.data) > limit:
+        if not link.has_characteristic(CUSTOM_CHAR):
+            # Only custom firmware can be asked to open the extended area, and
+            # sending anyway would overrun the slot rather than fail cleanly.
+            msg = (
+                f"{image.name} is {len(image.data)} bytes, over this device's "
+                f"{limit}-byte update slot, and it offers no way to enlarge it"
+            )
+            raise OTAError(msg)
+        log.info(
+            "%s is %d bytes, over the %d-byte slot; erasing the extended area, "
+            "which discards the stored Mi Home keys and measurement history",
+            image.name,
+            len(image.data),
+            limit,
+        )
+        await request_ext_ota(link, len(image.data))
 
     if link.has_characteristic(MI_SPEED_CHAR):
         # Only stock firmware has this; it asks for a faster connection.
@@ -125,18 +162,6 @@ async def update(
         await link.write(OTA_CHAR, command)
     await asyncio.sleep(START_SETTLE)
 
-    if len(image.data) > MAX_BLE_OTA_SIZE:
-        # Stock MJWSD05MMC has a 208 KiB slot and custom firmware reports its
-        # own, so we cannot know the real limit from here. Say so rather than
-        # discovering it partway through an upload.
-        log.warning(
-            "%s is %d bytes, over the standard %d-byte update slot; this only "
-            "works if the device has the extended slot",
-            image.name,
-            len(image.data),
-            MAX_BLE_OTA_SIZE,
-        )
-
     total = image.block_count
     log.info("sending %s: %d blocks (%d bytes)", image.name, total, len(image.data))
     for number in range(total):
@@ -145,7 +170,7 @@ async def update(
             status = await link.read(OTA_CHAR)
             if status and status[0]:
                 msg = f"device aborted at block {number}: {describe(status[0])}"
-                raise OtaError(msg)
+                raise OTAError(msg)
         if progress is not None:
             progress(number + 1, total)
 
@@ -170,7 +195,7 @@ async def request_ext_ota(
     """
     if not link.has_characteristic(CUSTOM_CHAR):
         msg = "extended OTA needs the pvvx config characteristic"
-        raise OtaError(msg)
+        raise OTAError(msg)
 
     kilobytes = (size + 1023) >> 10
     queue = await link.ensure_subscribed(CUSTOM_CHAR)
@@ -198,7 +223,7 @@ async def request_ext_ota(
                 if result not in (_EXT_OTA_ERASING, _EXT_OTA_PROGRESS):
                     detail = _EXT_OTA_RESULTS.get(result, f"code {result}")
                     msg = f"device refused the extended OTA request: {detail}"
-                    raise OtaError(msg)
+                    raise OTAError(msg)
     except TimeoutError:
         msg = f"device did not finish erasing within {timeout:g}s"
-        raise OtaError(msg) from None
+        raise OTAError(msg) from None

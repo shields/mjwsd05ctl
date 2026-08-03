@@ -23,6 +23,7 @@ import asyncio
 import os
 import time
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
@@ -60,6 +61,16 @@ SAMPLE = bytes(
 DEV_ID_REPLY = (
     bytes([7]) + b"\x34\x12" + b"\x08\x05" + b"\x02\x01" + bytes([10, 20, 30, 40])
 )
+
+# `scomfort_t` holding the firmware's own defaults (`def_cmf` in app.c): 21.00
+# to 26.00 °C and 30.00 to 60.00 %, each a little-endian 16-bit count of
+# hundredths. 2100 = 0x0834, 2600 = 0x0A28, 3000 = 0x0BB8, 6000 = 0x1770.
+COMFORT_SAMPLE = bytes.fromhex("3408280ab80b7017")
+
+# What DEV_MAC answers with: a length byte, the public address least
+# significant byte first, then the two bytes that differ in the random static
+# address. Written down those are A4:C1:38:11:22:33 and C0:44:55:11:22:33.
+MAC_STORED = bytes.fromhex("33221138c1a45544")
 
 
 def test_the_config_is_eleven_bytes() -> None:
@@ -195,11 +206,16 @@ class FakeLink:
     """Enough of `transport.Link` to answer configuration commands."""
 
     def __init__(
-        self, *, has_characteristic: bool = True, bindkey_missing: bool = False
+        self,
+        *,
+        has_characteristic: bool = True,
+        bindkey_missing: bool = False,
+        mac_reply: bytes = bytes([len(MAC_STORED)]) + MAC_STORED,
     ) -> None:
         self.queue: asyncio.Queue[bytes] = asyncio.Queue()
         self.writes: list[bytes] = []
         self.silent = False
+        self.mac_reply = mac_reply
         self._present = has_characteristic
         # Simulates a device with no Xiaomi bind key stored: BKEY replies come
         # back short, rather than the usual 16 bytes.
@@ -243,9 +259,17 @@ class FakeLink:
             self.queue.put_nowait(bytes([CommandId.BKEY]) + reply_key)
         elif command == CommandId.DEV_ID:
             self.queue.put_nowait(bytes([CommandId.DEV_ID]) + DEV_ID_REPLY)
+        elif command == CommandId.COMFORT:
+            # The firmware saves whatever it was sent and then reports the
+            # band it now holds, which is that same value.
+            stored = request[1:9] if len(request) > 1 else COMFORT_SAMPLE
+            self.queue.put_nowait(bytes([CommandId.COMFORT]) + stored)
+        elif command == CommandId.DEV_MAC:
+            reply = self.mac_reply
+            self.queue.put_nowait(bytes([CommandId.DEV_MAC]) + reply)
 
 
-async def session(**kwargs: bool) -> tuple[config.Session, FakeLink]:
+async def session(**kwargs: Any) -> tuple[config.Session, FakeLink]:
     link = FakeLink(**kwargs)
     ses = config.Session(link)  # ty: ignore[invalid-argument-type]
     await ses.open()
@@ -377,6 +401,145 @@ async def test_set_mi_keys_rejects_a_token_or_bindkey_of_the_wrong_length() -> N
         await ses.set_mi_keys(b"short", bytes(range(16)))
     with pytest.raises(ConfigError, match="12-byte token and a 16-byte bind key"):
         await ses.set_mi_keys(bytes(range(12)), b"short")
+
+
+async def test_comfort_reads_the_band_the_firmware_ships_with() -> None:
+    ses, link = await session()
+    zone = await ses.comfort()
+    # A bare opcode is a read: the firmware only overwrites the band when the
+    # request carries one, so this must send no payload.
+    assert link.writes == [bytes([CommandId.COMFORT])]
+    assert zone.temperature_min == 2100
+    assert zone.temperature_max == 2600
+    assert zone.humidity_min == 3000
+    assert zone.humidity_max == 6000
+    assert config.comfort_to_dict(zone) == {
+        "temperature_min": 21.0,
+        "temperature_max": 26.0,
+        "humidity_min": 30.0,
+        "humidity_max": 60.0,
+    }
+
+
+async def test_writing_the_comfort_band_sends_eight_little_endian_values() -> None:
+    ses, link = await session()
+    zone = await ses.comfort()
+    config.apply_comfort(zone, {"temperature_min": "-5.5", "humidity_max": "62.25"})
+    written = await ses.write_comfort(zone)
+
+    request = link.writes[-1]
+    assert request[0] == CommandId.COMFORT
+    assert len(request) == config.COMFORT_SIZE + 1
+    # -5.50 °C is -550, which is 0xFDDA as a signed 16-bit little-endian value;
+    # 62.25 % is 6225 = 0x1851. Getting the signedness wrong shows up here.
+    assert request[1:3] == bytes.fromhex("dafd")
+    assert request[7:9] == bytes.fromhex("5118")
+    assert written.temperature_min == -550
+    assert written.humidity_max == 6225
+
+
+def test_a_temperature_below_freezing_survives_the_round_trip() -> None:
+    # Humidity is unsigned in the C, temperature is not; parsing both the same
+    # way turns a cold room into 655 °C.
+    zone = config.COMFORT.parse(bytes.fromhex("dafd280ab80b7017"))
+    assert zone.temperature_min == -550
+    assert config.comfort_to_dict(zone)["temperature_min"] == -5.5
+
+
+def test_a_humidity_with_its_top_bit_set_is_not_read_as_negative() -> None:
+    # `scomfort_t.h` is `u16`, and the firmware stores whatever it is sent, so
+    # a value above 327.67 % is representable. Read as signed it would come
+    # back negative, which is the mirror image of the bug above and invisible
+    # for the 0..100 % values anyone would actually set.
+    zone = config.COMFORT.parse(bytes.fromhex("3408280a0080ffff"))
+    assert zone.humidity_min == 0x8000
+    assert zone.humidity_max == 0xFFFF
+    assert config.comfort_to_dict(zone)["humidity_max"] == 655.35
+
+
+def test_a_short_comfort_reply_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="only 4 bytes"):
+        config._parse_comfort(COMFORT_SAMPLE[:4])
+
+
+def test_comfort_limits_are_rejected_before_touching_hardware() -> None:
+    with pytest.raises(ConfigError, match="unknown comfort limit"):
+        config.validate_comfort({"tempurature_min": "20"})
+    with pytest.raises(ConfigError, match="expected a number"):
+        config.validate_comfort({"temperature_min": "chilly"})
+    with pytest.raises(ConfigError, match="outside"):
+        config.validate_comfort({"temperature_min": "400"})
+    with pytest.raises(ConfigError, match="outside"):
+        config.validate_comfort({"humidity_min": "-1"})
+
+
+def test_comfort_values_are_stored_as_hundredths() -> None:
+    assert config.validate_comfort({"temperature_min": "20.5"}) == {
+        "temperature_min": 2050
+    }
+    # Rounded, not truncated: 20.999 must not become 20.99.
+    assert config.validate_comfort({"temperature_max": "20.999"}) == {
+        "temperature_max": 2100
+    }
+
+
+def test_a_band_whose_floor_is_above_its_ceiling_is_refused() -> None:
+    # Only one edge is being set, so the check has to look at the band as a
+    # whole after the change, not at the value on its own.
+    zone = config.COMFORT.parse(COMFORT_SAMPLE)
+    with pytest.raises(ConfigError, match="no reading can satisfy"):
+        config.apply_comfort(zone, {"temperature_min": "30"})
+
+    zone = config.COMFORT.parse(COMFORT_SAMPLE)
+    with pytest.raises(ConfigError, match="no reading can satisfy"):
+        config.apply_comfort(zone, {"humidity_max": "10"})
+
+    zone = config.COMFORT.parse(COMFORT_SAMPLE)
+    assert config.apply_comfort(zone, {"temperature_min": "20"}).temperature_min == 2000
+
+
+async def test_the_mac_address_is_reported_the_way_it_is_written_down() -> None:
+    ses, link = await session()
+    addresses = await ses.mac_address()
+    assert link.writes == [bytes([CommandId.DEV_MAC])]
+    # Flash holds the address least significant byte first.
+    assert addresses.public == "A4:C1:38:11:22:33"
+    # The random static address keeps the public address's first three bytes,
+    # takes the two the device generated, and always ends 0xC0.
+    assert addresses.random_static == "C0:44:55:11:22:33"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        bytes([8]) + MAC_STORED[:5],  # the eight bytes were not all sent
+        # One byte short of a whole reply. The two random static bytes are the
+        # last thing in it, so a `<` guard here reads past the end instead of
+        # refusing, and the boundary is the only place that shows.
+        bytes([8]) + MAC_STORED[:7],
+        bytes([6]) + MAC_STORED,  # a length that is not what we can parse
+    ],
+)
+async def test_an_unusable_mac_reply_is_refused_rather_than_guessed(
+    reply: bytes,
+) -> None:
+    ses, _ = await session(mac_reply=reply)
+    with pytest.raises(ConfigError, match="DEV_MAC"):
+        await ses.mac_address()
+
+
+def test_the_software_version_is_read_out_of_the_low_byte_as_bcd() -> None:
+    # VERSION in app_config.h is 0x58 for firmware 5.8, and only the low byte
+    # of sw_version carries it; anything above it must not leak into the name.
+    identity = config.DEV_ID.parse(
+        bytes([CommandId.DEV_ID, 0])
+        + b"\x0c\x00"  # hw_version 12
+        + b"\x58\x01"  # sw_version 0x0158
+        + b"\x00\x00"
+        + bytes(4)
+    )
+    assert identity.sw_version == 0x0158
+    assert config.software_version(identity) == "5.8"
 
 
 async def test_reboot_writes_the_reboot_command() -> None:

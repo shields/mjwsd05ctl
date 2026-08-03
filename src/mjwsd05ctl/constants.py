@@ -75,8 +75,12 @@ FIRMWARE_NAMES = {HW_ID_CH: "BTH_v58.bin", HW_ID_EN: "BTE_v58.bin"}
 CONFIG_VERSION = 0x58
 
 # Stock MJWSD05MMC accepts an image up to 208 KiB; a device already running
-# custom firmware reports its own limit, defaulting to the 128 KiB OTA slot.
+# custom firmware keeps its own image in low flash and offers the 128 KiB OTA
+# slot. The international unit is held to less still: the reference flasher
+# sends anything over 112 KiB through the extended area on hardware id 12
+# (TelinkMiFlasher.html:2373), which is where a stock image goes back on.
 MAX_BLE_OTA_SIZE = 0x20000
+MAX_BLE_OTA_SIZE_EN = 0x1C000
 MAX_EXT_OTA_SIZE = 0x34000
 
 

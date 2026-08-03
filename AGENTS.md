@@ -51,6 +51,21 @@ implementation of the Xiaomi handshake. Specifically:
   than 2 as a failure aborts on the first progress tick. Status 0 is not an
   acknowledgement either: it means the address was below `BIG_OTA2_FADDR` and
   nothing started.
+- The update slot is not one size. Stock firmware lends out all 208 KiB, custom
+  firmware keeps 128 KiB — and 112 KiB on hardware id 12, which the reference
+  flasher singles out (`TelinkMiFlasher.html:2373`) and the C does not explain.
+  Anything larger has to go through the extended area first, which erases the
+  stored Mi Home keys and the measurement history, so do not widen the condition
+  that triggers it.
+- Addresses come back from `CMD_ID_DEV_MAC` least significant byte first, the
+  reverse of how they are written down, and the reply is `[len][mac][rand]`
+  rather than bare bytes. The random static address reuses the public address's
+  first three bytes and always ends `0xC0`. Sending `[0x10, 0x00]` does not read
+  the address — it erases the MAC sector and resets the device — so a read must
+  carry no payload at all.
+- Comfort limits (`CMD_ID_COMFORT`) are hundredths, and `scomfort_t` is signed
+  for temperature and unsigned for humidity. Parsing both the same way turns
+  −5 °C into 655 °C.
 
 When changing any of these, update the test that pins it. The tests derive
 expected values independently — HKDF written out by hand, ciphertext built the
@@ -82,7 +97,12 @@ separately.
 
 Do not call `pair()`. The firmware leaves its characteristics at `No_Security`
 unless a PIN has been set, so bonding buys nothing and is unreliable on some
-stacks. `transport.connect` takes `pair=` for the PIN case only.
+stacks. `transport.connect` takes `pair=`, and the CLI's `--pin` sets it, for
+the PIN case only.
+
+Bleak has no passkey API: its BlueZ backend calls `Device1.Pair()` and registers
+no `org.bluez.Agent1`, so the code is collected by whatever agent the system
+already has. Do not document `--pin` as prompting for anything.
 
 ## Platform
 

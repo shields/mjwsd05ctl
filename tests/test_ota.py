@@ -20,12 +20,17 @@ import pytest
 from mjwsd05ctl import ota
 from mjwsd05ctl.constants import (
     CUSTOM_CHAR,
+    HW_ID_CH,
+    HW_ID_EN,
+    MAX_BLE_OTA_SIZE,
+    MAX_BLE_OTA_SIZE_EN,
+    MAX_EXT_OTA_SIZE,
     MI_SPEED_CHAR,
     MI_SPEED_FAST,
     OTA_START_COMMANDS,
     CommandId,
 )
-from mjwsd05ctl.errors import OtaError
+from mjwsd05ctl.errors import OTAError
 from mjwsd05ctl.firmware import FirmwareImage
 from mjwsd05ctl.ota import crc16_modbus, describe, end_frame, frame
 
@@ -48,7 +53,7 @@ def test_frame_layout() -> None:
 
 
 def test_frame_rejects_a_short_block() -> None:
-    with pytest.raises(OtaError, match="expected 16"):
+    with pytest.raises(OTAError, match="expected 16"):
         frame(0, b"\x00" * 15)
 
 
@@ -130,7 +135,7 @@ async def test_extended_update_reports_address_below_the_slot_as_a_failure() -> 
     # ext_ota.c: status 0 means the requested address was below the extended
     # slot's base (BIG_OTA2_FADDR), so nothing started -- it is not an ack.
     link = FakeLink(replies=[bytes([CommandId.SET_OTA, 0])])
-    with pytest.raises(OtaError, match="address is below the extended update area"):
+    with pytest.raises(OTAError, match="address is below the extended update area"):
         await ota.request_ext_ota(link, 8192)  # ty: ignore[invalid-argument-type]
 
 
@@ -145,7 +150,7 @@ async def test_extended_update_subscribes_to_the_config_characteristic_itself() 
 
 async def test_extended_update_reports_a_refusal() -> None:
     link = FakeLink(replies=[bytes([CommandId.SET_OTA, 0xFE])])
-    with pytest.raises(OtaError, match="bad address or size"):
+    with pytest.raises(OTAError, match="bad address or size"):
         await ota.request_ext_ota(link, 8192)  # ty: ignore[invalid-argument-type]
 
 
@@ -160,23 +165,40 @@ async def test_extended_update_rounds_the_erase_size_up_to_a_kilobyte() -> None:
 
 async def test_extended_update_times_out_as_a_domain_error() -> None:
     link = FakeLink()
-    with pytest.raises(OtaError, match="did not finish erasing"):
+    with pytest.raises(OTAError, match="did not finish erasing"):
         await ota.request_ext_ota(link, 8192, timeout=0.05)  # ty: ignore[invalid-argument-type]
 
 
 class FakeOTADevice:
     """Records the update stream and answers the periodic status reads."""
 
-    def __init__(self, *, fail_at: int | None = None, speed_char: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_at: int | None = None,
+        speed_char: bool = False,
+        custom_char: bool = True,
+    ) -> None:
         self.frames: list[bytes] = []
         self.fail_at = fail_at
         self.speed_char = speed_char
+        self.custom_char = custom_char
         self.status = 0
+        self.subscribed: list[str] = []
+        self._queue: asyncio.Queue[bytes] = asyncio.Queue()
+        # Whatever asks for the extended area gets an immediate all-clear.
+        self._queue.put_nowait(bytes([CommandId.SET_OTA, 3]))
 
     def has_characteristic(self, uuid: str) -> bool:
         if uuid == MI_SPEED_CHAR:
             return self.speed_char
+        if uuid == CUSTOM_CHAR:
+            return self.custom_char
         return True
+
+    async def ensure_subscribed(self, uuid: str) -> asyncio.Queue[bytes]:
+        self.subscribed.append(uuid)
+        return self._queue
 
     async def write(
         self, uuid: str, data: bytes, *, response: bool | None = None
@@ -233,7 +255,7 @@ async def test_update_stops_when_the_device_reports_an_error() -> None:
     # Pin the block number, not just the error text: OTA_STATUS_INTERVAL is 8,
     # so the first poll must fire after the block numbered 7 (the 8th block),
     # not one early or late.
-    with pytest.raises(OtaError, match="device aborted at block 7: CRC error in data"):
+    with pytest.raises(OTAError, match="device aborted at block 7: CRC error in data"):
         await ota.update(device, image)  # ty: ignore[invalid-argument-type]
     # It gave up rather than sending the rest of the image.
     assert len(device.frames) < image.block_count
@@ -245,13 +267,28 @@ async def test_update_refuses_a_device_with_no_update_service() -> None:
             del uuid
             return False
 
-    with pytest.raises(OtaError, match="does not expose"):
+    with pytest.raises(OTAError, match="does not expose"):
         await ota.update(NoOTA(), FirmwareImage(name="t", data=bytes(16)))  # ty: ignore[invalid-argument-type]
 
 
+def test_the_slot_size_depends_on_what_the_device_is_running() -> None:
+    # Stock firmware lends out its whole 208 KiB slot; custom firmware is in
+    # low flash already and keeps 128 KiB, or 112 KiB on the EN unit, which is
+    # the case the reference flasher singles out by hardware id.
+    assert ota.ordinary_slot_size(FakeOTADevice(custom_char=False)) == MAX_EXT_OTA_SIZE  # ty: ignore[invalid-argument-type]
+    assert ota.ordinary_slot_size(FakeOTADevice()) == MAX_BLE_OTA_SIZE  # ty: ignore[invalid-argument-type]
+    assert ota.ordinary_slot_size(FakeOTADevice(), HW_ID_CH) == MAX_BLE_OTA_SIZE  # ty: ignore[invalid-argument-type]
+    assert ota.ordinary_slot_size(FakeOTADevice(), HW_ID_EN) == MAX_BLE_OTA_SIZE_EN  # ty: ignore[invalid-argument-type]
+    # A stock device's slot does not shrink just because it is the EN unit.
+    assert (
+        ota.ordinary_slot_size(FakeOTADevice(custom_char=False), HW_ID_EN)  # ty: ignore[invalid-argument-type]
+        == MAX_EXT_OTA_SIZE
+    )
+
+
 @pytest.mark.usefixtures("_instant")
-async def test_update_warns_but_proceeds_when_the_image_exceeds_the_ble_ota_size(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+async def test_update_erases_the_extended_area_for_an_image_over_the_slot(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A real oversize image is ~8200 blocks; shrink the limit instead of the
     # image so the test stays fast.
@@ -260,22 +297,61 @@ async def test_update_warns_but_proceeds_when_the_image_exceeds_the_ble_ota_size
     device = FakeOTADevice()
     await ota.update(device, image)  # ty: ignore[invalid-argument-type]
 
-    assert "big.bin is 48 bytes, over the standard 32-byte update slot" in caplog.text
+    # The area has to be erased before the update starts, not after: the
+    # device only redirects the stream once it reports the area ready.
+    assert device.frames[0][0] == CommandId.SET_OTA
+    assert device.subscribed == [CUSTOM_CHAR]
+    assert device.frames[1 : 1 + len(OTA_START_COMMANDS)] == list(OTA_START_COMMANDS)
     assert device.frames[-1] == ota.end_frame(image.block_count)
 
 
 @pytest.mark.usefixtures("_instant")
-async def test_update_does_not_warn_when_the_image_exactly_fills_the_ble_ota_size(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+async def test_update_leaves_the_extended_area_alone_when_the_image_fits(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # An image that exactly fills the slot is not oversize; only strictly
-    # more than MAX_BLE_OTA_SIZE bytes should trigger the warning.
+    # An image that exactly fills the slot is not oversize. Erasing the
+    # extended area needlessly would throw away the Mi Home keys and the
+    # measurement history, so the boundary has to be strictly greater than.
     monkeypatch.setattr(ota, "MAX_BLE_OTA_SIZE", 32)
     image = FirmwareImage(name="fits.bin", data=bytes(32))
     device = FakeOTADevice()
     await ota.update(device, image)  # ty: ignore[invalid-argument-type]
 
-    assert "over the standard" not in caplog.text
+    assert device.subscribed == []
+    assert device.frames[0] == OTA_START_COMMANDS[0]
+
+
+@pytest.mark.usefixtures("_instant")
+async def test_update_sends_the_international_unit_through_the_extended_area_sooner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ota, "MAX_BLE_OTA_SIZE", 48)
+    monkeypatch.setattr(ota, "MAX_BLE_OTA_SIZE_EN", 32)
+    image = FirmwareImage(name="mid.bin", data=bytes(48))
+
+    chinese = FakeOTADevice()
+    await ota.update(chinese, image, hardware_id=HW_ID_CH)  # ty: ignore[invalid-argument-type]
+    assert chinese.subscribed == []
+
+    english = FakeOTADevice()
+    await ota.update(english, image, hardware_id=HW_ID_EN)  # ty: ignore[invalid-argument-type]
+    assert english.subscribed == [CUSTOM_CHAR]
+
+
+@pytest.mark.usefixtures("_instant")
+async def test_update_refuses_an_image_too_big_for_a_slot_it_cannot_enlarge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without the pvvx config characteristic there is no way to ask for the
+    # extended area, and streaming anyway would overrun the slot.
+    monkeypatch.setattr(ota, "MAX_EXT_OTA_SIZE", 32)
+    image = FirmwareImage(name="huge.bin", data=bytes(48))
+    device = FakeOTADevice(custom_char=False)
+
+    with pytest.raises(OTAError, match="no way to enlarge it"):
+        await ota.update(device, image)  # ty: ignore[invalid-argument-type]
+
+    assert device.frames == []
 
 
 async def test_extended_update_refuses_a_device_with_no_config_characteristic() -> None:
@@ -284,5 +360,5 @@ async def test_extended_update_refuses_a_device_with_no_config_characteristic() 
             del uuid
             return False
 
-    with pytest.raises(OtaError, match="pvvx config characteristic"):
+    with pytest.raises(OTAError, match="pvvx config characteristic"):
         await ota.request_ext_ota(NoConfigChar(), 8192)  # ty: ignore[invalid-argument-type]

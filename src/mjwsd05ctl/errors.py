@@ -27,7 +27,7 @@ class FirmwareError(Error):
     """A firmware image is missing, malformed, or too large for the device."""
 
 
-class OtaError(Error):
+class OTAError(Error):
     """The device rejected or aborted an over-the-air update."""
 
 

@@ -37,6 +37,7 @@ from .transport import Link, connect, scan
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from contextlib import AbstractAsyncContextManager
 
 log = logging.getLogger("mjwsd05ctl")
 
@@ -77,6 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adapter", help="Bluetooth adapter to use, such as hci0")
     parser.add_argument("--keys", type=Path, help="path to the Xiaomi key store")
     parser.add_argument("--json", action="store_true", help="emit JSON, not text")
+    parser.add_argument(
+        "--pin",
+        action="store_true",
+        help="bond with the device, which is needed only once a PIN code has "
+        "been set on it; the code is collected by whatever Bluetooth agent the "
+        "system has registered, such as bluetoothctl, not by this tool",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def device_args(sub: argparse.ArgumentParser) -> None:
@@ -146,6 +154,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     config_parser.set_defaults(handler=cmd_config)
 
+    comfort_parser = subparsers.add_parser(
+        "comfort", help="show or set the band the display's smiley reflects"
+    )
+    device_args(comfort_parser)
+    comfort_parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="change a limit, such as temperature_min=20.5; may be repeated",
+    )
+    comfort_parser.set_defaults(handler=cmd_comfort)
+
+    reboot_parser = subparsers.add_parser("reboot", help="restart the device")
+    device_args(reboot_parser)
+    reboot_parser.set_defaults(handler=cmd_reboot)
+
     read_parser = subparsers.add_parser("read", help="decode advertisements")
     read_parser.add_argument(
         "--address", action="append", default=[], help="only this device; repeatable"
@@ -163,6 +188,21 @@ def build_parser() -> argparse.ArgumentParser:
     read_parser.set_defaults(handler=cmd_read)
 
     return parser
+
+
+def open_link(
+    args: argparse.Namespace, address: str | None = None
+) -> AbstractAsyncContextManager[Link]:
+    """Connect to the device this invocation is about.
+
+    Every command goes through here so that `--pin` reaches all of them; a call
+    site that connected on its own would silently ignore it.
+    """
+    return connect(
+        args.address if address is None else address,
+        adapter=args.adapter,
+        pair=args.pin,
+    )
 
 
 async def cmd_scan(args: argparse.Namespace) -> int:
@@ -215,7 +255,7 @@ class ScanRow:
 
 
 async def cmd_info(args: argparse.Namespace) -> int:
-    async with connect(args.address, adapter=args.adapter) as link:
+    async with open_link(args) as link:
         info = await link.device_info()
         report: dict[str, Any] = {
             "address": link.address,
@@ -230,9 +270,18 @@ async def cmd_info(args: argparse.Namespace) -> int:
         if link.has_service(CUSTOM_SERVICE):
             session = config_module.Session(link)
             await session.open()
+            addresses = await session.mac_address()
+            # The address the connection came in on is a per-host UUID on macOS,
+            # so the one the device reports is not redundant with it.
+            report["mac_address"] = addresses.public
+            report["random_mac_address"] = addresses.random_static
+            identity = await session.device_id()
+            report["firmware_version"] = config_module.software_version(identity)
+            report["bindkey_stored"] = await session.get_bindkey() is not None
             cfg = await session.read_config()
             report["config"] = config_module.to_dict(cfg)
             report["derived"] = config_module.derived(cfg)
+            report["comfort"] = config_module.comfort_to_dict(await session.comfort())
 
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -248,7 +297,7 @@ async def cmd_info(args: argparse.Namespace) -> int:
 
 
 async def cmd_activate(args: argparse.Namespace) -> int:
-    async with connect(args.address, adapter=args.adapter) as link:
+    async with open_link(args) as link:
         keys = await activate(link)
         store = Keystore.open(args.keys)
         store.put(link.address, keys)
@@ -277,7 +326,7 @@ async def activate(link: Link) -> MiKeys:
 
 
 async def cmd_flash(args: argparse.Namespace) -> int:
-    async with connect(args.address, adapter=args.adapter) as link:
+    async with open_link(args) as link:
         await flash(link, args, login_first=not args.skip_activation)
     return 0
 
@@ -299,7 +348,7 @@ async def flash(link: Link, args: argparse.Namespace, *, login_first: bool) -> N
 
     info = await link.device_info()
     image = firmware.resolve(info.hardware_id, args.firmware)
-    await ota.update(link, image, progress=_progress)
+    await ota.update(link, image, hardware_id=info.hardware_id, progress=_progress)
     if sys.stderr.isatty():
         print(file=sys.stderr)
 
@@ -313,7 +362,7 @@ def _progress(done: int, total: int) -> None:
 
 async def cmd_bootstrap(args: argparse.Namespace) -> int:
     keys: MiKeys | None = None
-    async with connect(args.address, adapter=args.adapter) as link:
+    async with open_link(args) as link:
         address = link.address
         if link.has_service(CUSTOM_SERVICE):
             log.info("device already runs custom firmware; skipping activation")
@@ -328,7 +377,7 @@ async def cmd_bootstrap(args: argparse.Namespace) -> int:
     log.info("waiting for the device to restart")
     await asyncio.sleep(REBOOT_WAIT)
 
-    async with connect(address, adapter=args.adapter) as link:
+    async with open_link(args, address) as link:
         session = config_module.Session(link)
         await session.open()
         cfg = await session.read_config()
@@ -360,7 +409,7 @@ async def cmd_config(args: argparse.Namespace) -> int:
 
     settings = _parse_settings(args.set)
     config_module.validate(settings)
-    async with connect(args.address, adapter=args.adapter) as link:
+    async with open_link(args) as link:
         session = config_module.Session(link)
         await session.open()
 
@@ -392,6 +441,50 @@ async def cmd_config(args: argparse.Namespace) -> int:
             print(f"{name:<26} {value}")
         for name, value in extra.items():
             print(f"{name:<26} {value:g}")
+    return 0
+
+
+async def cmd_comfort(args: argparse.Namespace) -> int:
+    settings = _parse_settings(args.set)
+    config_module.validate_comfort(settings)
+    async with open_link(args) as link:
+        session = config_module.Session(link)
+        await session.open()
+        zone = await session.comfort()
+        if settings:
+            zone = await session.write_comfort(
+                config_module.apply_comfort(zone, settings)
+            )
+        report = config_module.comfort_to_dict(zone)
+
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(
+            f"Comfortable between {report['temperature_min']:g} and "
+            f"{report['temperature_max']:g} °C, {report['humidity_min']:g} and "
+            f"{report['humidity_max']:g} %"
+        )
+    return 0
+
+
+async def cmd_reboot(args: argparse.Namespace) -> int:
+    async with open_link(args) as link:
+        address = link.address
+        session = config_module.Session(link)
+        await session.open()
+        await session.reboot()
+
+    # The firmware restarts on disconnect, not on the command itself, so this
+    # is only true once the connection above has been closed.
+    if args.json:
+        print(
+            json.dumps(
+                {"address": address, "restarting": True}, indent=2, sort_keys=True
+            )
+        )
+    else:
+        print("Device is restarting.")
     return 0
 
 
