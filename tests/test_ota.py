@@ -1,0 +1,288 @@
+# Copyright © 2026 Michael Shields
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import struct
+
+import pytest
+
+from mjwsd05ctl import ota
+from mjwsd05ctl.constants import (
+    CUSTOM_CHAR,
+    MI_SPEED_CHAR,
+    MI_SPEED_FAST,
+    OTA_START_COMMANDS,
+    CommandId,
+)
+from mjwsd05ctl.errors import OtaError
+from mjwsd05ctl.firmware import FirmwareImage
+from mjwsd05ctl.ota import crc16_modbus, describe, end_frame, frame
+
+
+def test_crc16_modbus_known_answers() -> None:
+    # The canonical CRC-16/MODBUS check value for "123456789".
+    assert crc16_modbus(b"123456789") == 0x4B37
+    assert crc16_modbus(b"") == 0xFFFF
+    assert crc16_modbus(b"\x00") == 0x40BF
+
+
+def test_frame_layout() -> None:
+    payload = bytes(range(16))
+    built = frame(0x1234, payload)
+    assert len(built) == 20
+    assert built[:2] == b"\x34\x12"
+    assert built[2:18] == payload
+    # The CRC covers the sequence number as well as the data.
+    assert built[18:] == crc16_modbus(built[:18]).to_bytes(2, "little")
+
+
+def test_frame_rejects_a_short_block() -> None:
+    with pytest.raises(OtaError, match="expected 16"):
+        frame(0, b"\x00" * 15)
+
+
+def test_end_frame_repeats_the_last_block_inverted() -> None:
+    # 5355 blocks means the last is 5354 == 0x14EA, whose complement is 0xEB15.
+    assert end_frame(5355) == bytes.fromhex("02ffea1415eb")
+    assert end_frame(1) == bytes.fromhex("02ff0000ffff")
+
+
+def test_describe_covers_the_error_table() -> None:
+    assert describe(0) == "success"
+    assert describe(2) == "CRC error in data"
+    # OTA_ERRORS has 7 entries (indices 0-6); the boundary one past the last
+    # defined entry must still fall back cleanly rather than index out of range.
+    assert describe(7) == "unknown status 7"
+    assert describe(99) == "unknown status 99"
+
+
+class FakeLink:
+    """Enough of `transport.Link` for the extended-update request."""
+
+    def __init__(self, *, replies: list[bytes] | None = None) -> None:
+        self._queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self.writes: list[bytes] = []
+        self.subscribed: list[str] = []
+        for reply in replies or []:
+            self._queue.put_nowait(reply)
+
+    def has_characteristic(self, uuid: str) -> bool:
+        del uuid
+        return True
+
+    def queue(self, uuid: str) -> asyncio.Queue[bytes]:
+        del uuid
+        return self._queue
+
+    async def ensure_subscribed(self, uuid: str) -> asyncio.Queue[bytes]:
+        self.subscribed.append(uuid)
+        return self._queue
+
+    async def write(
+        self, uuid: str, data: bytes, *, response: bool | None = None
+    ) -> None:
+        del uuid, response
+        self.writes.append(data)
+
+
+async def test_extended_update_asks_for_the_right_area() -> None:
+    link = FakeLink(replies=[bytes([CommandId.SET_OTA, 3, 0, 0, 4, 0, 200, 0, 0, 0])])
+    await ota.request_ext_ota(link, 200 * 1024)  # ty: ignore[invalid-argument-type]
+    request = link.writes[0]
+    assert request[0] == CommandId.SET_OTA
+    assert struct.unpack("<II", request[1:]) == (0x40000, 200)
+
+
+async def test_extended_update_waits_through_the_erase() -> None:
+    # ext_ota.c: check_ext_ota() acks the request with BUSY (2), then
+    # clear_ota_area() pushes EVENT (4) once per flash sector it clears, and
+    # finally READY (3) once the whole area is erased. Script that real
+    # sequence rather than a single acknowledgement.
+    link = FakeLink(
+        replies=[
+            bytes([CommandId.MEASURE, 0]),  # unrelated chatter
+            bytes([CommandId.SET_OTA, 2]),  # accepted, erase starting
+            bytes([CommandId.SET_OTA, 4]),  # sector cleared
+            bytes([CommandId.SET_OTA, 4]),  # sector cleared
+            bytes([CommandId.SET_OTA, 4]),  # sector cleared
+            bytes([CommandId.SET_OTA, 3]),  # ready
+        ]
+    )
+    await ota.request_ext_ota(link, 8192)  # ty: ignore[invalid-argument-type]
+    # It kept reading through every progress tick until the terminal READY
+    # rather than stopping early at the unrelated notification or treating a
+    # progress tick as a refusal.
+    assert link.queue(CUSTOM_CHAR).empty()
+
+
+async def test_extended_update_reports_address_below_the_slot_as_a_failure() -> None:
+    # ext_ota.c: status 0 means the requested address was below the extended
+    # slot's base (BIG_OTA2_FADDR), so nothing started -- it is not an ack.
+    link = FakeLink(replies=[bytes([CommandId.SET_OTA, 0])])
+    with pytest.raises(OtaError, match="address is below the extended update area"):
+        await ota.request_ext_ota(link, 8192)  # ty: ignore[invalid-argument-type]
+
+
+async def test_extended_update_subscribes_to_the_config_characteristic_itself() -> None:
+    # Nothing subscribes on this path before request_ext_ota runs, so it has to
+    # establish the subscription rather than assume a caller already did; asking
+    # for a queue that does not exist yet is a TransportError.
+    link = FakeLink(replies=[bytes([CommandId.SET_OTA, 3])])
+    await ota.request_ext_ota(link, 8192)  # ty: ignore[invalid-argument-type]
+    assert link.subscribed == [CUSTOM_CHAR]
+
+
+async def test_extended_update_reports_a_refusal() -> None:
+    link = FakeLink(replies=[bytes([CommandId.SET_OTA, 0xFE])])
+    with pytest.raises(OtaError, match="bad address or size"):
+        await ota.request_ext_ota(link, 8192)  # ty: ignore[invalid-argument-type]
+
+
+async def test_extended_update_rounds_the_erase_size_up_to_a_kilobyte() -> None:
+    link = FakeLink(replies=[bytes([CommandId.SET_OTA, 3])])
+    # One byte past a KiB boundary must still ask the device to erase a whole
+    # extra KiB, or the device would erase less flash than the image needs.
+    await ota.request_ext_ota(link, 8193)  # ty: ignore[invalid-argument-type]
+    request = link.writes[0]
+    assert struct.unpack("<II", request[1:])[1] == 9  # ceil(8193 / 1024)
+
+
+async def test_extended_update_times_out_as_a_domain_error() -> None:
+    link = FakeLink()
+    with pytest.raises(OtaError, match="did not finish erasing"):
+        await ota.request_ext_ota(link, 8192, timeout=0.05)  # ty: ignore[invalid-argument-type]
+
+
+class FakeOTADevice:
+    """Records the update stream and answers the periodic status reads."""
+
+    def __init__(self, *, fail_at: int | None = None, speed_char: bool = False) -> None:
+        self.frames: list[bytes] = []
+        self.fail_at = fail_at
+        self.speed_char = speed_char
+        self.status = 0
+
+    def has_characteristic(self, uuid: str) -> bool:
+        if uuid == MI_SPEED_CHAR:
+            return self.speed_char
+        return True
+
+    async def write(
+        self, uuid: str, data: bytes, *, response: bool | None = None
+    ) -> None:
+        del uuid, response
+        self.frames.append(data)
+        if self.fail_at is not None and len(self.frames) > self.fail_at:
+            self.status = 2  # CRC error
+
+    async def read(self, uuid: str) -> bytes:
+        del uuid
+        return bytes([self.status])
+
+
+@pytest.fixture
+def _instant(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ota, "SPEED_SETTLE", 0.0)
+    monkeypatch.setattr(ota, "START_SETTLE", 0.0)
+
+
+@pytest.mark.usefixtures("_instant")
+async def test_update_streams_the_whole_image() -> None:
+    image = FirmwareImage(name="test.bin", data=bytes(range(256)) * 2)
+    device = FakeOTADevice()
+    seen: list[tuple[int, int]] = []
+    await ota.update(device, image, progress=lambda d, t: seen.append((d, t)))  # ty: ignore[invalid-argument-type]
+
+    start = list(OTA_START_COMMANDS)
+    assert device.frames[: len(start)] == start
+    body = device.frames[len(start) : -1]
+    assert len(body) == image.block_count
+    assert b"".join(f[2:18] for f in body) == image.data
+    assert device.frames[-1] == ota.end_frame(image.block_count)
+    # Check an intermediate call, where done != total: at completion both
+    # coordinates are equal, so that alone can't tell (done, total) from a
+    # swapped (total, done).
+    assert seen[0] == (1, image.block_count)
+    assert seen[-1] == (image.block_count, image.block_count)
+
+
+@pytest.mark.usefixtures("_instant")
+async def test_update_uses_the_speed_characteristic_when_the_device_has_one() -> None:
+    image = FirmwareImage(name="test.bin", data=bytes(16))
+    device = FakeOTADevice(speed_char=True)
+    await ota.update(device, image)  # ty: ignore[invalid-argument-type]
+    assert device.frames[0] == MI_SPEED_FAST
+
+
+@pytest.mark.usefixtures("_instant")
+async def test_update_stops_when_the_device_reports_an_error() -> None:
+    # Long enough to reach the first status poll, which is after eight blocks.
+    image = FirmwareImage(name="test.bin", data=bytes(16 * 32))
+    device = FakeOTADevice(fail_at=4)
+    # Pin the block number, not just the error text: OTA_STATUS_INTERVAL is 8,
+    # so the first poll must fire after the block numbered 7 (the 8th block),
+    # not one early or late.
+    with pytest.raises(OtaError, match="device aborted at block 7: CRC error in data"):
+        await ota.update(device, image)  # ty: ignore[invalid-argument-type]
+    # It gave up rather than sending the rest of the image.
+    assert len(device.frames) < image.block_count
+
+
+async def test_update_refuses_a_device_with_no_update_service() -> None:
+    class NoOTA(FakeOTADevice):
+        def has_characteristic(self, uuid: str) -> bool:
+            del uuid
+            return False
+
+    with pytest.raises(OtaError, match="does not expose"):
+        await ota.update(NoOTA(), FirmwareImage(name="t", data=bytes(16)))  # ty: ignore[invalid-argument-type]
+
+
+@pytest.mark.usefixtures("_instant")
+async def test_update_warns_but_proceeds_when_the_image_exceeds_the_ble_ota_size(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A real oversize image is ~8200 blocks; shrink the limit instead of the
+    # image so the test stays fast.
+    monkeypatch.setattr(ota, "MAX_BLE_OTA_SIZE", 32)
+    image = FirmwareImage(name="big.bin", data=bytes(48))
+    device = FakeOTADevice()
+    await ota.update(device, image)  # ty: ignore[invalid-argument-type]
+
+    assert "big.bin is 48 bytes, over the standard 32-byte update slot" in caplog.text
+    assert device.frames[-1] == ota.end_frame(image.block_count)
+
+
+@pytest.mark.usefixtures("_instant")
+async def test_update_does_not_warn_when_the_image_exactly_fills_the_ble_ota_size(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An image that exactly fills the slot is not oversize; only strictly
+    # more than MAX_BLE_OTA_SIZE bytes should trigger the warning.
+    monkeypatch.setattr(ota, "MAX_BLE_OTA_SIZE", 32)
+    image = FirmwareImage(name="fits.bin", data=bytes(32))
+    device = FakeOTADevice()
+    await ota.update(device, image)  # ty: ignore[invalid-argument-type]
+
+    assert "over the standard" not in caplog.text
+
+
+async def test_extended_update_refuses_a_device_with_no_config_characteristic() -> None:
+    class NoConfigChar(FakeLink):
+        def has_characteristic(self, uuid: str) -> bool:
+            del uuid
+            return False
+
+    with pytest.raises(OtaError, match="pvvx config characteristic"):
+        await ota.request_ext_ota(NoConfigChar(), 8192)  # ty: ignore[invalid-argument-type]

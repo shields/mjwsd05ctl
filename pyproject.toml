@@ -1,0 +1,62 @@
+# Copyright © 2026 Michael Shields
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[project]
+name = "mjwsd05ctl"
+version = "0.1.0"
+description = "Browser-free CLI to activate, flash, configure, and read the Xiaomi MJWSD05MMC thermometer"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Michael Shields", email = "shields@msrl.com" }]
+dependencies = [
+  "bleak>=3.0.2",
+  "construct>=2.10.70",
+  "cryptography>=50.0.0",
+  "pycryptodome>=3.23.0",
+]
+
+[project.optional-dependencies]
+mqtt = ["paho-mqtt>=2.1.0"]
+
+[project.scripts]
+mjwsd05ctl = "mjwsd05ctl.cli:main"
+
+[dependency-groups]
+dev = [
+  "paho-mqtt>=2.1.0",
+  "pytest>=9.1.1",
+  "pytest-asyncio>=1.4.0",
+  "pytest-cov>=7.1.0",
+  "ruff>=0.16.1",
+  "ty>=0.0.65",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["src/mjwsd05ctl"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = ["if __name__ == .__main__.:"]
+fail_under = 100
+show_missing = true

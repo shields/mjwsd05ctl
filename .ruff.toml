@@ -1,0 +1,59 @@
+# Copyright © 2023-2026 Michael Shields
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Target Python 3.14+ for maximum modernization
+target-version = "py314"
+
+[lint]
+# https://docs.astral.sh/ruff/rules/
+select = ["ALL"]
+
+ignore = [
+  "ANN401", # typing.Any
+  "C90",    # Cyclomatic complexity
+  "D",      # pydocstyle (disable docstring rules)
+  "PLR09",  # "Too many" branches, arguments, etc.
+  "T201",   # print()
+  "RUF001", # ambiguous Unicode character in string
+  "RUF002", # ambiguous Unicode character in docstring
+  "RUF003", # ambiguous Unicode character in comment
+
+  # Redundant with or conflicting with the Ruff formatter:
+  # https://docs.astral.sh/ruff/formatter/#conflicting-lint-rules
+  "W191",   # tab-indentation
+  "E111",   # indentation-with-invalid-multiple
+  "E114",   # indentation-with-invalid-multiple-comment
+  "E117",   # over-indented
+  "COM812", # missing-trailing-comma
+  "COM819", # prohibited-trailing-comma
+  "Q",      # flake8-quotes
+
+  # Project-specific, beyond the shared configuration:
+  # Timeouts here are protocol deadlines derived from how the device behaves,
+  # not caller policy. Removing them so callers must wrap every call in
+  # asyncio.timeout would push device-specific knowledge onto the caller.
+  "ASYNC109", # async-function-with-timeout
+]
+
+[lint.per-file-ignores]
+"tests/**" = [
+  "FBT001",  # pytest.mark.parametrize passes booleans positionally
+  "INP001",  # tests are collected by pytest, not imported as a package
+  "PLR2004", # magic values are the point of a known-answer test
+  "S101",    # bare assert is how pytest tests are written
+  "SLF001",  # tests may reach into private helpers
+  "TC001",   # deferring imports buys a test nothing but indentation
+  "TC002",
+  "TC003",
+]
