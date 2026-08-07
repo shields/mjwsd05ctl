@@ -293,7 +293,7 @@ class MiAuth:
         try:
             async with asyncio.timeout(timeout):
                 while True:
-                    source, value = await self._events.get()
+                    source, value = await self._link.take(self._events)
                     if source == MI_AUTH_CONTROL_CHAR:
                         if self._handle_status(value):
                             return

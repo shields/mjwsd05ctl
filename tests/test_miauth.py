@@ -31,7 +31,7 @@ from Crypto.Cipher import AES
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from mjwsd05ctl import miauth
+from mjwsd05ctl import miauth, transport
 from mjwsd05ctl.constants import (
     MI_AUTH_CONTROL_CHAR,
     MI_AUTH_DATA_CHAR,
@@ -40,7 +40,7 @@ from mjwsd05ctl.constants import (
     MI_LOGIN_INFO,
     MI_SETUP_INFO,
 )
-from mjwsd05ctl.errors import ActivationError
+from mjwsd05ctl.errors import ActivationError, TransportError
 from mjwsd05ctl.miauth import MiAuth, MiKeys
 
 
@@ -290,13 +290,22 @@ class FakeLink:
         self.device = device
         self.queue: asyncio.Queue[tuple[str, bytes]] = asyncio.Queue()
         self.writes: list[tuple[str, bytes]] = []
+        self._disconnected = asyncio.Event()
         device.outbox = self.queue
+
+    def disconnect(self) -> None:
+        self._disconnected.set()
 
     async def subscribe_tagged(
         self, uuids: Sequence[str]
     ) -> asyncio.Queue[tuple[str, bytes]]:
         assert set(uuids) == {MI_AUTH_CONTROL_CHAR, MI_AUTH_DATA_CHAR}
         return self.queue
+
+    async def take(self, queue: asyncio.Queue[tuple[str, bytes]]) -> tuple[str, bytes]:
+        # Borrow the real implementation so the pump is tested against the
+        # actual disconnect semantics, not a lenient imitation.
+        return await transport.Link.take(self, queue)  # ty: ignore[invalid-argument-type]
 
     async def write(
         self, uuid: str, data: bytes, *, response: bool | None = None
@@ -318,6 +327,22 @@ async def run_flow(device: FakeDevice) -> tuple[MiAuth, FakeLink, MiKeys]:
     await auth.open()
     keys = await auth.register(timeout=5.0)
     return auth, link, keys
+
+
+async def test_a_disconnect_fails_the_handshake_immediately() -> None:
+    # A dead link must fail the pump at once, not sit out the whole protocol
+    # timeout waiting for notifications that can no longer arrive.
+    class DeafDevice(FakeDevice):
+        async def handle(self, uuid: str, payload: bytes) -> None:
+            del uuid, payload
+
+    link = FakeLink(DeafDevice())
+    auth = MiAuth(link)  # ty: ignore[invalid-argument-type]
+    await auth.open()
+    link.disconnect()
+    async with asyncio.timeout(1):
+        with pytest.raises(TransportError, match="device disconnected"):
+            await auth.register(timeout=5.0)
 
 
 async def test_registration_derives_the_same_keys_as_the_device() -> None:

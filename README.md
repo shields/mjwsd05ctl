@@ -72,13 +72,24 @@ registered, so on a headless machine keep `bluetoothctl` open alongside with
 
 ## Hardware
 
-Tested against Linux with BlueZ and an ASUS USB-BT500 (RTL8761BU). macOS works
-for reading and for most GATT work, but CoreBluetooth hides the device's
-Bluetooth address behind a per-host UUID and cannot initiate pairing, so prefer
-Linux for provisioning.
+Tested against Linux with BlueZ and an ASUS USB-BT500 (RTL8761BU), and against
+macOS with CoreBluetooth: activation, flashing, and configuration all work
+there too. CoreBluetooth hides the device's Bluetooth address behind a per-host
+UUID, so on macOS encrypted advertisements cannot be decrypted, saved keys are
+filed under an identifier no other machine shares, and pairing cannot be
+initiated.
 
 A factory-fresh device must be woken before it accepts a connection — hold both
-buttons until the display comes on.
+buttons until the display comes on. Stock firmware answers a registration only
+after a further arming sequence: hold both buttons until the screen blinks and
+the device resets, briefly press the top button, then the bottom one, and the
+Bluetooth icon starts flashing. Run `activate` or `bootstrap` while it is;
+without this, the registration request is simply never answered.
+
+Once the pvvx firmware is on, the device advertises every five seconds and is
+most willing to accept a connection in the moments after it boots. A short
+press of the top button — its "connect" function — speeds advertising up and
+opens a window in which connecting is reliable.
 
 ## Development
 

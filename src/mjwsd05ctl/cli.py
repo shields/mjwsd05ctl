@@ -29,7 +29,7 @@ from bleak import BleakError
 from . import config as config_module
 from . import firmware, ota, reader
 from .constants import CUSTOM_SERVICE, MI_AUTH_SERVICE, OTA_SERVICE, AdvertisingType
-from .errors import Error
+from .errors import Error, TransportError
 from .keystore import Keystore, bindkeys, normalise
 from .miauth import MiAuth, MiKeys
 from .mqtt import Publisher
@@ -44,6 +44,9 @@ log = logging.getLogger("mjwsd05ctl")
 # A device reboots into its new firmware after an update and needs a moment
 # before it will accept a connection again.
 REBOOT_WAIT = 8.0
+# The freshly booted firmware advertises every five seconds by default, so a
+# single ten-second scan misses it often enough to need more than one look.
+RECONNECT_ATTEMPTS = 4
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -377,6 +380,30 @@ async def cmd_bootstrap(args: argparse.Namespace) -> int:
     log.info("waiting for the device to restart")
     await asyncio.sleep(REBOOT_WAIT)
 
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            report = await _bootstrap_configure(args, address, keys)
+            break
+        except TransportError as exc:
+            if attempt == RECONNECT_ATTEMPTS:
+                raise
+            log.warning("reconnect %d/%d failed: %s", attempt, RECONNECT_ATTEMPTS, exc)
+
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print("Bootstrapped. Current settings:")
+        for name, value in report.items():
+            print(f"  {name}: {value}")
+    return 0
+
+
+async def _bootstrap_configure(
+    args: argparse.Namespace, address: str, keys: MiKeys | None
+) -> dict[str, int | bool | str]:
+    """One attempt at bootstrap's post-reboot configuration pass."""
     async with open_link(args, address) as link:
         session = config_module.Session(link)
         await session.open()
@@ -388,15 +415,7 @@ async def cmd_bootstrap(args: argparse.Namespace) -> int:
         if keys is not None:
             await session.set_bindkey(keys.bindkey)
             await session.set_mi_keys(keys.token, keys.bindkey)
-        report = config_module.to_dict(cfg)
-
-    if args.json:
-        print(json.dumps(report, indent=2, sort_keys=True))
-    else:
-        print("Bootstrapped. Current settings:")
-        for name, value in report.items():
-            print(f"  {name}: {value}")
-    return 0
+        return config_module.to_dict(cfg)
 
 
 async def cmd_config(args: argparse.Namespace) -> int:

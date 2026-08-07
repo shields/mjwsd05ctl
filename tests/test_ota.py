@@ -184,6 +184,7 @@ class FakeOTADevice:
         self.speed_char = speed_char
         self.custom_char = custom_char
         self.status = 0
+        self.reads = 0
         self.subscribed: list[str] = []
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
         # Whatever asks for the extended area gets an immediate all-clear.
@@ -210,6 +211,7 @@ class FakeOTADevice:
 
     async def read(self, uuid: str) -> bytes:
         del uuid
+        self.reads += 1
         return bytes([self.status])
 
 
@@ -217,6 +219,7 @@ class FakeOTADevice:
 def _instant(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ota, "SPEED_SETTLE", 0.0)
     monkeypatch.setattr(ota, "START_SETTLE", 0.0)
+    monkeypatch.setattr(ota, "END_SETTLE", 0.0)
 
 
 @pytest.mark.usefixtures("_instant")
@@ -232,6 +235,9 @@ async def test_update_streams_the_whole_image() -> None:
     assert len(body) == image.block_count
     assert b"".join(f[2:18] for f in body) == image.data
     assert device.frames[-1] == ota.end_frame(image.block_count)
+    # 32 blocks is a multiple of the polling interval, so the loop's own last
+    # poll already covered the final block; a further read would be redundant.
+    assert device.reads == image.block_count // 8
     # Check an intermediate call, where done != total: at completion both
     # coordinates are equal, so that alone can't tell (done, total) from a
     # swapped (total, done).
@@ -259,6 +265,22 @@ async def test_update_stops_when_the_device_reports_an_error() -> None:
         await ota.update(device, image)  # ty: ignore[invalid-argument-type]
     # It gave up rather than sending the rest of the image.
     assert len(device.frames) < image.block_count
+
+
+@pytest.mark.usefixtures("_instant")
+async def test_update_checks_the_status_after_the_final_block() -> None:
+    # Four blocks never reach the every-eighth poll, so only a status read
+    # after the last block can notice the device rejected the tail. Without
+    # it the update would report success, and the device would abandon the
+    # incomplete image and boot back into the old firmware.
+    image = FirmwareImage(name="test.bin", data=bytes(16 * 4))
+    device = FakeOTADevice(fail_at=3)
+    with pytest.raises(OTAError, match="device aborted at block 3: CRC error in data"):
+        await ota.update(device, image)  # ty: ignore[invalid-argument-type]
+    # It stopped rather than asking the device to commit a bad image, and the
+    # final read was the only one: four blocks never reach the periodic poll.
+    assert device.reads == 1
+    assert ota.end_frame(image.block_count) not in device.frames
 
 
 async def test_update_refuses_a_device_with_no_update_service() -> None:

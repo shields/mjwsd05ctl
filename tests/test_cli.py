@@ -34,7 +34,7 @@ from mjwsd05ctl.constants import (
     MI_AUTH_SERVICE,
     OTA_SERVICE,
 )
-from mjwsd05ctl.errors import ConfigError, Error
+from mjwsd05ctl.errors import ConfigError, Error, TransportError
 from mjwsd05ctl.firmware import FirmwareImage
 from mjwsd05ctl.keystore import normalise
 from mjwsd05ctl.miauth import MiKeys
@@ -224,10 +224,15 @@ class FakeLink:
 
 
 class FakeConnect:
-    """Replaces `connect`, handing out prepared links in order."""
+    """Replaces `connect`, handing out prepared links in order.
 
-    def __init__(self, *links: FakeLink) -> None:
+    `failures` lists 1-based call numbers that raise `TransportError` instead,
+    the way a scan that misses a slowly-advertising device does.
+    """
+
+    def __init__(self, *links: FakeLink, failures: Sequence[int] = ()) -> None:
         self._links = iter(links)
+        self._failures = frozenset(failures)
         self.calls: list[tuple[str | None, str | None]] = []
         self.paired: list[bool] = []
 
@@ -241,6 +246,9 @@ class FakeConnect:
     ) -> AsyncIterator[FakeLink]:
         self.calls.append((target, adapter))
         self.paired.append(pair)
+        if len(self.calls) in self._failures:
+            msg = "no device found within 10s"
+            raise TransportError(msg)
         yield next(self._links)
 
 
@@ -1004,6 +1012,70 @@ def test_bootstrap_skips_activation_for_a_device_already_on_custom_firmware(
     assert session.mi_keys_writes == []
     payload = json.loads(capsys.readouterr().out)
     assert payload["advertising_type"] == "BTHOME"
+
+
+def test_bootstrap_retries_the_reconnect_after_the_reboot(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(cli, "REBOOT_WAIT", 0.0)
+
+    async def fake_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(cli.asyncio, "sleep", fake_sleep)
+
+    link = FakeLink(address="A4:C1:38:00:00:22", services=frozenset({CUSTOM_SERVICE}))
+    second = FakeLink(address=link.address, services=frozenset({CUSTOM_SERVICE}))
+    # The device misses the first two post-reboot scans, as a freshly booted
+    # unit advertising every five seconds routinely does.
+    fake_connect = FakeConnect(link, second, failures=(2, 3))
+    monkeypatch.setattr(cli, "connect", fake_connect)
+    monkeypatch.setattr(cli, "Keystore", FakeKeystore())
+    monkeypatch.setattr(cli, "ota", FakeOTAModule())
+    image = FirmwareImage(name="fw.bin", data=b"\x00" * 16)
+    monkeypatch.setattr(cli, "firmware", FakeFirmwareModule(image))
+    fake_config = make_config_module(
+        {"advertising_type": "PVVX", "advertising_interval": 32}
+    )
+    monkeypatch.setattr(cli, "config_module", fake_config)
+
+    with caplog.at_level(logging.WARNING, logger="mjwsd05ctl"):
+        assert cli.main(["--json", "bootstrap"]) == 0
+
+    assert len(fake_connect.calls) == 4
+    assert "reconnect 1/4 failed" in caplog.text
+    assert "reconnect 2/4 failed" in caplog.text
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["advertising_type"] == "BTHOME"
+
+
+def test_bootstrap_gives_up_when_the_device_never_comes_back(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "REBOOT_WAIT", 0.0)
+
+    async def fake_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(cli.asyncio, "sleep", fake_sleep)
+
+    link = FakeLink(address="A4:C1:38:00:00:23", services=frozenset({CUSTOM_SERVICE}))
+    fake_connect = FakeConnect(link, failures=(2, 3, 4, 5))
+    monkeypatch.setattr(cli, "connect", fake_connect)
+    monkeypatch.setattr(cli, "Keystore", FakeKeystore())
+    monkeypatch.setattr(cli, "ota", FakeOTAModule())
+    image = FirmwareImage(name="fw.bin", data=b"\x00" * 16)
+    monkeypatch.setattr(cli, "firmware", FakeFirmwareModule(image))
+    fake_config = make_config_module({"advertising_type": "PVVX"})
+    monkeypatch.setattr(cli, "config_module", fake_config)
+
+    assert cli.main(["bootstrap"]) == 1
+
+    # One connection to flash, then every allowed reconnect attempt.
+    assert len(fake_connect.calls) == 1 + cli.RECONNECT_ATTEMPTS
+    assert "no device found" in capsys.readouterr().err
 
 
 def test_bootstrap_no_configure_stops_after_flashing(

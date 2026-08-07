@@ -106,10 +106,30 @@ already has. Do not document `--pin` as prompting for anything.
 
 ## Platform
 
-Provisioning targets Linux and BlueZ. macOS works for most GATT work but
-CoreBluetooth reports a per-host UUID instead of the hardware address, so
-encrypted advertisements cannot be decrypted there — `reader` detects this and
-says so rather than failing obscurely.
+Provisioning works on both Linux/BlueZ and macOS. CoreBluetooth reports a
+per-host UUID instead of the hardware address, so encrypted advertisements
+cannot be decrypted on macOS — `reader` detects this and says so rather than
+failing obscurely. Three more macOS lessons cost an evening of a device that
+would not answer or advertise until reset; do not undo their fixes:
+
+- CoreBluetooth connection requests never expire. A `BleakClient.connect` that
+  fails must still be `disconnect()`ed (`transport.connect` does), or the OS
+  daemon keeps the request pending, connects the moment the device next
+  advertises, and holds it — invisible and unreachable — indefinitely. The
+  firmware stops advertising while it believes a connection is up and only
+  re-arms advertising in its disconnect callback, so a phantom central keeps
+  the device dark until it is physically reset.
+- A write-without-response can vanish in the first moments of a connection,
+  observed while the firmware's connection-parameter update is in flight; the
+  same write two seconds later is answered in milliseconds. `Session.request`
+  resends unanswered commands, which is safe because every opcode it carries
+  is idempotent, and it first discards stale queued replies, because a resend
+  can double-answer and replies carry no request correlation — keep all of
+  these properties when adding commands.
+- The flashed firmware advertises every five seconds by default and accepts
+  connections most reliably right after boot or a top-button press (the pvvx
+  "connect" function), which is why `bootstrap` retries its post-reboot
+  reconnect instead of scanning once.
 
 ## Lint
 

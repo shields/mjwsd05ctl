@@ -50,6 +50,10 @@ log = logging.getLogger(__name__)
 # flasher, which is the only description of the timing that exists.
 SPEED_SETTLE = 0.5
 START_SETTLE = 0.3
+# The terminator is an unacknowledged write and the caller disconnects as soon
+# as the update returns, which discards anything the local stack still has
+# queued; give the final frame time to reach the air.
+END_SETTLE = 1.0
 
 type ProgressCallback = Callable[[int, int], None]
 
@@ -118,6 +122,13 @@ def ordinary_slot_size(link: Link, hardware_id: int | None = None) -> int:
     return MAX_BLE_OTA_SIZE
 
 
+async def _check_status(link: Link, number: int) -> None:
+    status = await link.read(OTA_CHAR)
+    if status and status[0]:
+        msg = f"device aborted at block {number}: {describe(status[0])}"
+        raise OTAError(msg)
+
+
 async def update(
     link: Link,
     image: FirmwareImage,
@@ -167,15 +178,20 @@ async def update(
     for number in range(total):
         await link.write(OTA_CHAR, frame(number, image.block(number)))
         if (number + 1) % OTA_STATUS_INTERVAL == 0:
-            status = await link.read(OTA_CHAR)
-            if status and status[0]:
-                msg = f"device aborted at block {number}: {describe(status[0])}"
-                raise OTAError(msg)
+            await _check_status(link, number)
         if progress is not None:
             progress(number + 1, total)
 
+    if total % OTA_STATUS_INTERVAL:
+        # The data frames are unacknowledged writes, so a final status read
+        # both verifies the tail of the image and forces it out of the local
+        # stack's queue before the terminator asks the device to commit. When
+        # the count is a multiple of the polling interval, the loop's own last
+        # poll has just done exactly this.
+        await _check_status(link, total - 1)
     await link.write(OTA_CHAR, end_frame(total))
     log.info("sent %d blocks; device is rebooting into the new firmware", total)
+    await asyncio.sleep(END_SETTLE)
 
 
 async def request_ext_ota(

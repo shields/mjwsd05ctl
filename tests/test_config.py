@@ -27,9 +27,9 @@ from typing import Any
 
 import pytest
 
-from mjwsd05ctl import config
+from mjwsd05ctl import config, transport
 from mjwsd05ctl.constants import CONFIG_VERSION, AdvertisingType, CommandId, ScreenType
-from mjwsd05ctl.errors import ConfigError
+from mjwsd05ctl.errors import ConfigError, TransportError
 
 # flg: advertising_type=3 at bits 0-1, comfort_smiley=1 at bit 2.
 FLG = 0b0000_0111
@@ -215,6 +215,10 @@ class FakeLink:
         self.queue: asyncio.Queue[bytes] = asyncio.Queue()
         self.writes: list[bytes] = []
         self.silent = False
+        self.drop_writes = 0
+        self.duplicate_replies = False
+        self.scripted: list[bytes] | None = None
+        self._disconnected = asyncio.Event()
         self.mac_reply = mac_reply
         self._present = has_characteristic
         # Simulates a device with no Xiaomi bind key stored: BKEY replies come
@@ -234,10 +238,25 @@ class FakeLink:
     ) -> None:
         del uuid, response
         self.writes.append(data)
+        if self.drop_writes:
+            self.drop_writes -= 1
+            return
         self.reply(data)
+
+    async def take(self, queue: asyncio.Queue[bytes]) -> bytes:
+        # Borrow the real implementation so consumers are tested against the
+        # actual disconnect semantics, not a lenient imitation.
+        return await transport.Link.take(self, queue)  # ty: ignore[invalid-argument-type]
+
+    def disconnect(self) -> None:
+        self._disconnected.set()
 
     def reply(self, request: bytes) -> None:
         if self.silent:
+            return
+        if self.scripted is not None:
+            for payload in self.scripted:
+                self.queue.put_nowait(payload)
             return
         command = request[0]
         if command in (CommandId.CFG, CommandId.CFG_DEF):
@@ -248,9 +267,11 @@ class FakeLink:
             # opcode byte is only ever written by test_config() (app.c); that
             # runs on the reset path too and stamps it back to CMD_ID_CFG
             # (cmd_parser.c / ble.h). A real device never echoes CFG_DEF back.
-            self.queue.put_nowait(
-                bytes([CommandId.CFG, CONFIG_VERSION]) + stored + b"\x00"
-            )
+            answer = bytes([CommandId.CFG, CONFIG_VERSION]) + stored + b"\x00"
+            self.queue.put_nowait(answer)
+            if self.duplicate_replies:
+                # As when a resend elicited a second answer to one command.
+                self.queue.put_nowait(answer)
         elif command == CommandId.UTC_TIME:
             self.queue.put_nowait(bytes([CommandId.UTC_TIME]) + request[1:5])
         elif command == CommandId.BKEY:
@@ -281,6 +302,47 @@ async def test_reading_the_config_skips_unrelated_notifications() -> None:
     cfg = await ses.read_config()
     assert cfg.advertising_interval == 32
     assert link.writes == [bytes([CommandId.CFG])]
+
+
+async def test_an_unanswered_command_is_sent_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The first write can be lost before it reaches the air (observed on
+    # macOS in a connection's first moments), so request() must resend an
+    # idempotent command rather than wait out its whole deadline. The short
+    # explicit deadline keeps a regression a fast failure, not a slow one.
+    monkeypatch.setattr(config, "RESEND_INTERVAL", 0.01)
+    ses, link = await session()
+    link.drop_writes = 1
+    response = await ses.request(CommandId.CFG, timeout=1.0)
+    assert response[0] == CONFIG_VERSION
+    assert link.writes == [bytes([CommandId.CFG])] * 2
+
+
+async def test_a_duplicate_reply_does_not_pass_for_the_next_answer() -> None:
+    # A resend can elicit two answers to one command; the leftover must not
+    # be mistaken for the reply to a later command with the same opcode, or
+    # write_config would report the pre-write settings as what was applied.
+    ses, link = await session()
+    link.duplicate_replies = True
+    cfg = await ses.read_config()
+    assert cfg.advertising_interval == 32
+    link.duplicate_replies = False
+    cfg.advertising_interval = 64
+    updated = await ses.write_config(cfg)
+    assert updated.advertising_interval == 64
+
+
+async def test_a_disconnect_fails_a_request_immediately() -> None:
+    # request() must consume the queue through link.take, whose disconnect
+    # check turns a dead link into an immediate error instead of a full
+    # protocol timeout and a misleading "did not answer".
+    ses, link = await session()
+    link.silent = True
+    link.disconnect()
+    async with asyncio.timeout(1):
+        with pytest.raises(TransportError, match="device disconnected"):
+            await ses.request(CommandId.CFG, timeout=5.0)
 
 
 async def test_writing_the_config_sends_no_version_byte() -> None:
@@ -366,9 +428,10 @@ async def test_request_expect_waits_for_the_named_opcode_not_the_sent_one() -> N
     # (what a naive implementation, or the firmware, does NOT do for CFG_DEF)
     # must still be ignored.
     ses, link = await session()
-    link.silent = True
-    link.queue.put_nowait(bytes([CommandId.CFG_DEF, 0xAA]))  # wrong tag: ignored
-    link.queue.put_nowait(bytes([CommandId.CFG, 0xBB]))  # matches `expect`
+    link.scripted = [
+        bytes([CommandId.CFG_DEF, 0xAA]),  # wrong tag: ignored
+        bytes([CommandId.CFG, 0xBB]),  # matches `expect`
+    ]
     response = await ses.request(CommandId.CFG_DEF, expect=CommandId.CFG)
     assert response == bytes([0xBB])
 

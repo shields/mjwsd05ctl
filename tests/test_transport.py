@@ -294,8 +294,13 @@ async def test_find_device_explains_an_address_that_cannot_be_found(
 
 
 class FakeCharacteristic:
-    def __init__(self, uuid: str) -> None:
+    def __init__(
+        self,
+        uuid: str,
+        properties: Sequence[str] = ("read", "write-without-response", "notify"),
+    ) -> None:
         self.uuid = uuid
+        self.properties = list(properties)
 
 
 class FakeService:
@@ -337,6 +342,7 @@ class FakeGATTClient:
         characteristic_uuids: Sequence[str] = (),
     ) -> None:
         self.address = address
+        self.kwargs: dict[str, Any] = {}
         self.services = FakeServices(service_uuids, characteristic_uuids)
         self._notify_handlers: dict[str, NotifyHandler] = {}
         self._reads: dict[str, bytes] = {}
@@ -385,6 +391,81 @@ class FakeGATTClient:
         self.disconnect_calls += 1
         if self.disconnect_error is not None:
             raise self.disconnect_error
+
+
+async def test_take_returns_a_notification() -> None:
+    link = transport.Link(FakeGATTClient())  # ty: ignore[invalid-argument-type]
+    queue: asyncio.Queue[bytes] = asyncio.Queue()
+    queue.put_nowait(b"\x01")
+    assert await link.take(queue) == b"\x01"
+
+
+async def test_take_raises_as_soon_as_the_connection_drops() -> None:
+    # Nothing posts to a notification queue after a disconnect, so without
+    # this a consumer would sit out its whole protocol timeout and then
+    # report a misleading "did not answer". The outer bound turns a
+    # regression into a fast failure rather than a hung test run.
+    dropped = asyncio.Event()
+    link = transport.Link(FakeGATTClient(), dropped)  # ty: ignore[invalid-argument-type]
+    queue: asyncio.Queue[bytes] = asyncio.Queue()
+    dropped.set()
+    async with asyncio.timeout(1):
+        with pytest.raises(TransportError, match="device disconnected"):
+            await link.take(queue)
+
+
+async def test_take_requeues_an_item_grabbed_as_the_caller_is_cancelled() -> None:
+    # A surrounding asyncio.timeout can cancel take() in the same tick that
+    # its internal get dequeues a notification; the item is already off the
+    # queue then, and dropping it would lose a protocol message for good.
+    link = transport.Link(FakeGATTClient())  # ty: ignore[invalid-argument-type]
+    queue: asyncio.Queue[bytes] = asyncio.Queue()
+    task = asyncio.get_running_loop().create_task(link.take(queue))
+    await asyncio.sleep(0)  # let take() start waiting on the queue
+    queue.put_nowait(b"\x07")
+    asyncio.get_running_loop().call_soon(task.cancel)
+    async with asyncio.timeout(1):
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert queue.get_nowait() == b"\x07"
+
+
+async def test_take_cancelled_while_the_queue_is_empty_requeues_nothing() -> None:
+    link = transport.Link(FakeGATTClient())  # ty: ignore[invalid-argument-type]
+    queue: asyncio.Queue[bytes] = asyncio.Queue()
+    task = asyncio.get_running_loop().create_task(link.take(queue))
+    await asyncio.sleep(0)
+    task.cancel()
+    async with asyncio.timeout(1):
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert queue.empty()
+
+
+async def test_take_prefers_data_over_a_simultaneous_disconnect() -> None:
+    # A notification that arrived before the drop must not be discarded.
+    dropped = asyncio.Event()
+    link = transport.Link(FakeGATTClient(), dropped)  # ty: ignore[invalid-argument-type]
+    queue: asyncio.Queue[bytes] = asyncio.Queue()
+    queue.put_nowait(b"\x02")
+    dropped.set()
+    assert await link.take(queue) == b"\x02"
+
+
+async def test_connect_wires_disconnection_into_take(
+    monkeypatch: pytest.MonkeyPatch, no_sleep: list[float]
+) -> None:
+    del no_sleep
+    device = BLEDevice("A4:C1:38:00:00:15", "ATC_o", None)
+    factory, made = bleak_client_factory()
+    monkeypatch.setattr(transport, "BleakClient", factory)
+
+    async with transport.connect(device) as link:
+        queue: asyncio.Queue[bytes] = asyncio.Queue()
+        made[0].kwargs["disconnected_callback"](made[0])
+        async with asyncio.timeout(1):
+            with pytest.raises(TransportError, match="device disconnected"):
+                await link.take(queue)
 
 
 def test_link_exposes_the_client_and_its_address() -> None:
@@ -462,6 +543,33 @@ async def test_write_sends_the_bytes_to_the_named_characteristic() -> None:
     link = transport.Link(client)  # ty: ignore[invalid-argument-type]
     await link.write(CUSTOM_CHAR, b"\x01\x02", response=True)
     assert client.writes == [(CUSTOM_CHAR, b"\x01\x02", True)]
+
+
+async def test_write_resolves_no_preference_to_without_response() -> None:
+    # The bool is resolved locally rather than left as None for Bleak, which
+    # deprecates omitting it; resolving here keeps the choice pinned by these
+    # tests instead of inherited from a dependency.
+    client = FakeGATTClient(characteristic_uuids=[CUSTOM_CHAR])
+    link = transport.Link(client)  # ty: ignore[invalid-argument-type]
+    await link.write(CUSTOM_CHAR, b"\x55")
+    assert client.writes == [(CUSTOM_CHAR, b"\x55", False)]
+
+
+async def test_write_resolves_no_preference_to_with_response_when_it_must() -> None:
+    client = FakeGATTClient(characteristic_uuids=[CUSTOM_CHAR])
+    char = client.services.get_characteristic(CUSTOM_CHAR)
+    assert char is not None
+    char.properties = ["read", "write"]
+    link = transport.Link(client)  # ty: ignore[invalid-argument-type]
+    await link.write(CUSTOM_CHAR, b"\x55")
+    assert client.writes == [(CUSTOM_CHAR, b"\x55", True)]
+
+
+async def test_write_defaults_to_with_response_for_an_unknown_characteristic() -> None:
+    client = FakeGATTClient()
+    link = transport.Link(client)  # ty: ignore[invalid-argument-type]
+    await link.write(CUSTOM_CHAR, b"\x55")
+    assert client.writes == [(CUSTOM_CHAR, b"\x55", True)]
 
 
 async def test_write_translates_a_bleak_error_into_a_transport_error() -> None:
@@ -575,8 +683,8 @@ def bleak_client_factory(
     made: list[FakeGATTClient] = []
 
     def factory(device: BLEDevice, **kwargs: Any) -> FakeGATTClient:
-        del kwargs
         client = FakeGATTClient(device.address)
+        client.kwargs = kwargs
         if len(made) < fail_attempts:
             client.connect_error = fail_error or BleakError("connection refused")
         client.disconnect_error = disconnect_error
@@ -694,6 +802,10 @@ async def test_connect_retries_after_a_failed_attempt_then_succeeds(
         assert link.address == device.address
 
     assert [c.connect_calls for c in made] == [1, 1]
+    # The failed client must be cancelled, not abandoned: an uncancelled
+    # request stays pending in the OS daemon (CoreBluetooth ones never
+    # expire), which then captures the device at its next advertisement.
+    assert [c.disconnect_calls for c in made] == [1, 1]
     assert no_sleep == [1.0]
     assert "connection attempt 1/3 failed" in caplog.text
 
@@ -712,6 +824,7 @@ async def test_connect_retries_after_a_timeout_error(
         assert link.address == device.address
 
     assert [c.connect_calls for c in made] == [1, 1]
+    assert [c.disconnect_calls for c in made] == [1, 1]
     assert no_sleep == [1.0]
 
 
@@ -730,6 +843,7 @@ async def test_connect_raises_after_every_attempt_fails(
             pytest.fail("the body must not run if every attempt failed")
 
     assert len(made) == 2
+    assert [c.disconnect_calls for c in made] == [1, 1]
     assert no_sleep == [1.0, 1.0]
 
 

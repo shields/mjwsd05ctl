@@ -83,9 +83,14 @@ class Link:
     written as straight-line `await` code against these queues.
     """
 
-    def __init__(self, client: BleakClient) -> None:
+    def __init__(
+        self, client: BleakClient, disconnected: asyncio.Event | None = None
+    ) -> None:
+        if disconnected is None:
+            disconnected = asyncio.Event()
         self._client = client
         self._queues: dict[str, asyncio.Queue[bytes]] = {}
+        self._disconnected = disconnected
 
     @property
     def client(self) -> BleakClient:
@@ -136,6 +141,33 @@ class Link:
             await self._client.start_notify(uuid, make_handler(uuid))
         return merged
 
+    async def take[T](self, queue: asyncio.Queue[T]) -> T:
+        """The next notification from a queue, unless the connection drops.
+
+        Nothing posts to a queue after a disconnect, so waiting on one blind
+        would sit out the caller's whole protocol timeout for an answer that
+        can no longer come.
+        """
+        get = asyncio.ensure_future(queue.get())
+        dropped = asyncio.ensure_future(self._disconnected.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (get, dropped), return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            # The caller's cancellation can land just as the get finishes, and
+            # its item is already off the queue; put it back or it is lost.
+            if get.done() and not get.cancelled() and get.exception() is None:
+                queue.put_nowait(get.result())
+            raise
+        finally:
+            get.cancel()
+            dropped.cancel()
+        if get in done:
+            return get.result()
+        msg = "device disconnected"
+        raise TransportError(msg)
+
     def queue(self, uuid: str) -> asyncio.Queue[bytes]:
         try:
             return self._queues[uuid]
@@ -161,12 +193,22 @@ class Link:
     ) -> None:
         """Write a characteristic.
 
-        `response=None` lets Bleak pick write-with-response only when the
-        characteristic lacks write-without-response, matching what Web
-        Bluetooth's `writeValue` does for the reference implementation. Both the
-        Telink OTA and pvvx config characteristics are write-without-response,
-        which is what makes an upload finish in a reasonable time.
+        `response=None` picks write-with-response only when the characteristic
+        lacks write-without-response, matching what Web Bluetooth's `writeValue`
+        does for the reference implementation. Both the Telink OTA and pvvx
+        config characteristics are write-without-response, which is what makes
+        an upload finish in a reasonable time.
+
+        The resolution to an explicit bool happens here rather than being left
+        to Bleak, which deprecates omitting it; doing it locally also keeps the
+        choice pinned by tests rather than inherited from a dependency.
         """
+        if response is None:
+            char = self._client.services.get_characteristic(uuid)
+            if char is None:
+                response = True
+            else:
+                response = "write-without-response" not in char.properties
         log.debug("write %s -> %s", _short(uuid), data.hex())
         try:
             await self._client.write_gatt_char(uuid, data, response=response)
@@ -302,23 +344,31 @@ async def connect(
 
     last: Exception | None = None
     for attempt in range(1, attempts + 1):
+        disconnected = asyncio.Event()
         client = BleakClient(
             device,
             timeout=timeout,
             pair=pair,
+            disconnected_callback=lambda _c, event=disconnected: event.set(),
             bluez=BlueZClientArgs(adapter=adapter) if adapter else BlueZClientArgs(),
         )
         try:
             await client.connect()
         except (BleakError, TimeoutError) as exc:
             last = exc
+            # A failed attempt must still be cancelled: CoreBluetooth
+            # connection requests never expire, so an abandoned one lives on
+            # in the OS daemon, which then connects the moment the device
+            # next advertises and holds the link, unreachable, indefinitely.
+            with contextlib.suppress(BleakError, TimeoutError):
+                await client.disconnect()
             log.warning("connection attempt %d/%d failed: %s", attempt, attempts, exc)
             await asyncio.sleep(1.0)
             continue
 
         log.info("connected to %s", device.address)
         try:
-            yield Link(client)
+            yield Link(client, disconnected)
         finally:
             with contextlib.suppress(BleakError, TimeoutError):
                 await client.disconnect()

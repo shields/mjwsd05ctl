@@ -56,6 +56,10 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 RESPONSE_TIMEOUT = 10.0
+# A write-without-response can be lost in the first moments of a connection —
+# observed on macOS while the firmware's connection-parameter update is in
+# flight — so an unanswered command is sent again after this long.
+RESEND_INTERVAL = 2.0
 
 CFG = Struct(
     "flg"
@@ -258,20 +262,37 @@ class Session:
 
         `expect` names the opcode the reply carries when it is not the one that
         was sent, which is the case for `CFG_DEF`.
+
+        An unanswered command is re-sent every `RESEND_INTERVAL` until the
+        deadline: the write can be lost before it reaches the air, and every
+        command issued through here is idempotent, so repeating one is safe.
+        A resend can also double-answer when the first reply was merely slow,
+        so each request begins by discarding stale queued replies — the
+        protocol carries no correlation, and a leftover with the right opcode
+        would otherwise pass for this command's answer.
         """
         if self.queue is None:
             msg = "Session.open() must be called before issuing commands"
             raise ConfigError(msg)
         wanted = command if expect is None else expect
-        await self.link.write(CUSTOM_CHAR, bytes([command]) + payload)
+        message = bytes([command]) + payload
+        while not self.queue.empty():
+            stale = self.queue.get_nowait()
+            log.debug("discarding stale notification %s", stale.hex())
         try:
             async with asyncio.timeout(timeout):
                 while True:
-                    response = await self.queue.get()
-                    # Unrelated notifications, such as streamed measurements,
-                    # share this characteristic.
-                    if response and response[0] == wanted:
-                        return response[1:]
+                    await self.link.write(CUSTOM_CHAR, message)
+                    try:
+                        async with asyncio.timeout(RESEND_INTERVAL):
+                            while True:
+                                response = await self.link.take(self.queue)
+                                # Unrelated notifications, such as streamed
+                                # measurements, share this characteristic.
+                                if response and response[0] == wanted:
+                                    return response[1:]
+                    except TimeoutError:
+                        log.debug("%s unanswered; sending it again", command.name)
         except TimeoutError:
             msg = f"device did not answer command {command.name} within {timeout:g}s"
             raise ConfigError(msg) from None
