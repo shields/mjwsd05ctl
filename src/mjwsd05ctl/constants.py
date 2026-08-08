@@ -27,7 +27,10 @@ def uuid16(value: int) -> str:
     return f"0000{value:04x}-0000-1000-8000-00805f9b34fb"
 
 
-# Xiaomi "mible" authentication service, present on stock firmware.
+# Xiaomi "mible" authentication service. The service itself does not mark
+# stock firmware: the pvvx firmware's GATT table ends with a bare FE95 service
+# declaration holding no characteristics (`app_att.c`), so only the
+# characteristics below distinguish the two.
 MI_AUTH_SERVICE = uuid16(0xFE95)
 MI_AUTH_CONTROL_CHAR = uuid16(0x0010)  # enc_10 in TelinkMiFlasher.html
 MI_AUTH_DATA_CHAR = uuid16(0x0019)  # enc_19

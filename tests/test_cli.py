@@ -31,6 +31,7 @@ from mjwsd05ctl.constants import (
     CUSTOM_SERVICE,
     HW_ID_CH,
     HW_ID_EN,
+    MI_AUTH_CONTROL_CHAR,
     MI_AUTH_SERVICE,
     OTA_SERVICE,
 )
@@ -214,13 +215,29 @@ class FakeLink:
 
     address: str = "A4:C1:38:11:22:33"
     services: frozenset[str] = frozenset()
+    characteristics: frozenset[str] = frozenset()
     info: DeviceInfo = field(default_factory=lambda: DeviceInfo(None, None, None))
 
     def has_service(self, uuid: str) -> bool:
         return uuid in self.services
 
+    def has_characteristic(self, uuid: str) -> bool:
+        return uuid in self.characteristics
+
     async def device_info(self) -> DeviceInfo:
         return self.info
+
+
+def make_stock_link(
+    address: str = "A4:C1:38:11:22:33", info: DeviceInfo | None = None
+) -> FakeLink:
+    """A fake presenting stock firmware's GATT: FE95 with its characteristics."""
+    return FakeLink(
+        address=address,
+        services=frozenset({MI_AUTH_SERVICE}),
+        characteristics=frozenset({MI_AUTH_CONTROL_CHAR}),
+        info=info if info is not None else DeviceInfo(None, None, None),
+    )
 
 
 class FakeConnect:
@@ -669,9 +686,11 @@ def test_info_shows_settings_from_custom_firmware_as_text(
     info = DeviceInfo(
         firmware_revision="0005-pvvx", hardware_revision="1.0", software_revision="5.8"
     )
+    # The pvvx firmware keeps a decoy FE95 service with no characteristics in
+    # it, so its presence alone must not read as stock firmware.
     link = FakeLink(
         address="A4:C1:38:00:00:09",
-        services=frozenset({CUSTOM_SERVICE, OTA_SERVICE}),
+        services=frozenset({CUSTOM_SERVICE, OTA_SERVICE, MI_AUTH_SERVICE}),
         info=info,
     )
     monkeypatch.setattr(cli, "connect", FakeConnect(link))
@@ -760,7 +779,7 @@ def test_info_omits_config_for_stock_firmware(
     info = DeviceInfo(
         firmware_revision=None, hardware_revision=None, software_revision=None
     )
-    link = FakeLink(services=frozenset({MI_AUTH_SERVICE}), info=info)
+    link = make_stock_link(info=info)
     monkeypatch.setattr(cli, "connect", FakeConnect(link))
     fake_config = make_config_module({"advertising_interval": 32})
     monkeypatch.setattr(cli, "config_module", fake_config)
@@ -781,7 +800,7 @@ def test_info_omits_config_for_stock_firmware(
 def test_activate_registers_and_saves_keys_as_text(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    link = FakeLink(address="a4:c1:38:00:00:09", services=frozenset({MI_AUTH_SERVICE}))
+    link = make_stock_link(address="a4:c1:38:00:00:09")
     monkeypatch.setattr(cli, "connect", FakeConnect(link))
     factory, _ = make_miauth(KEYS)
     monkeypatch.setattr(cli, "MiAuth", factory)
@@ -802,7 +821,7 @@ def test_activate_registers_and_saves_keys_as_text(
 def test_activate_json_reports_the_normalised_address(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    link = FakeLink(address="a4:c1:38:00:00:09", services=frozenset({MI_AUTH_SERVICE}))
+    link = make_stock_link(address="a4:c1:38:00:00:09")
     monkeypatch.setattr(cli, "connect", FakeConnect(link))
     factory, _ = make_miauth(KEYS)
     monkeypatch.setattr(cli, "MiAuth", factory)
@@ -819,15 +838,28 @@ def test_activate_json_reports_the_normalised_address(
     }
 
 
-def test_activate_refuses_a_device_with_no_xiaomi_service(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    "services",
+    [
+        frozenset(),
+        # The pvvx firmware's decoy FE95 service: the service is present but
+        # holds no characteristics, so it must be refused just the same.
+        frozenset({MI_AUTH_SERVICE, CUSTOM_SERVICE}),
+    ],
+    ids=["no service", "empty decoy service"],
+)
+def test_activate_refuses_a_device_without_xiaomi_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    services: frozenset[str],
 ) -> None:
-    link = FakeLink(services=frozenset())
+    link = FakeLink(services=services)
     monkeypatch.setattr(cli, "connect", FakeConnect(link))
 
     assert cli.main(["activate"]) == 1
 
-    assert "does not offer the Xiaomi authentication service" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "does not offer the Xiaomi authentication characteristics" in err
 
 
 # --- flash -------------------------------------------------------------
@@ -839,7 +871,7 @@ def test_flash_command_skips_activation_when_asked(
     info = DeviceInfo(
         firmware_revision=None, hardware_revision=None, software_revision=None
     )
-    link = FakeLink(services=frozenset({MI_AUTH_SERVICE}), info=info)
+    link = make_stock_link(info=info)
     monkeypatch.setattr(cli, "connect", FakeConnect(link))
     fake_ota = FakeOTAModule()
     monkeypatch.setattr(cli, "ota", fake_ota)
@@ -861,7 +893,7 @@ def test_flash_command_skips_activation_when_asked(
 def test_flash_logs_in_with_saved_keys_before_updating(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    link = FakeLink(services=frozenset({MI_AUTH_SERVICE}))
+    link = make_stock_link()
     monkeypatch.setattr(cli, "connect", FakeConnect(link))
     fake_keystore = FakeKeystore()
     fake_keystore.saved[normalise(link.address)] = KEYS
@@ -887,7 +919,7 @@ def test_flash_logs_in_with_saved_keys_before_updating(
 async def test_flash_refuses_to_run_without_saved_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    link = FakeLink(services=frozenset({MI_AUTH_SERVICE}))
+    link = make_stock_link()
     monkeypatch.setattr(cli, "Keystore", FakeKeystore())
     args = argparse.Namespace(keys=None, firmware=None)
 
@@ -898,13 +930,16 @@ async def test_flash_refuses_to_run_without_saved_keys(
 def test_flash_does_not_attempt_a_login_on_a_device_already_running_custom_firmware(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # `login_first` defaults True (no `--skip-activation`), but a device that
-    # only offers CUSTOM_SERVICE has no Xiaomi auth service to log in to; the
-    # gate must check for MI_AUTH_SERVICE too, not just `login_first`.
+    # `login_first` defaults True (no `--skip-activation`), but the pvvx
+    # firmware has no Xiaomi authentication to log in to. It does keep a decoy
+    # FE95 service with no characteristics in it, which is why the gate must
+    # look for the control characteristic and not settle for the service.
     info = DeviceInfo(
         firmware_revision=None, hardware_revision=None, software_revision=None
     )
-    link = FakeLink(services=frozenset({CUSTOM_SERVICE}), info=info)
+    link = FakeLink(
+        services=frozenset({CUSTOM_SERVICE, OTA_SERVICE, MI_AUTH_SERVICE}), info=info
+    )
     monkeypatch.setattr(cli, "connect", FakeConnect(link))
     fake_keystore = FakeKeystore()
     monkeypatch.setattr(cli, "Keystore", fake_keystore)
@@ -936,9 +971,7 @@ def test_bootstrap_activates_flashes_and_configures_a_fresh_device(
 
     monkeypatch.setattr(cli.asyncio, "sleep", fake_sleep)
 
-    stock_link = FakeLink(
-        address="A4:C1:38:00:00:09", services=frozenset({MI_AUTH_SERVICE})
-    )
+    stock_link = make_stock_link(address="A4:C1:38:00:00:09")
     custom_link = FakeLink(
         address=stock_link.address, services=frozenset({CUSTOM_SERVICE})
     )
@@ -1081,7 +1114,7 @@ def test_bootstrap_gives_up_when_the_device_never_comes_back(
 def test_bootstrap_no_configure_stops_after_flashing(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    link = FakeLink(services=frozenset({MI_AUTH_SERVICE}))
+    link = make_stock_link()
     fake_connect = FakeConnect(link)
     monkeypatch.setattr(cli, "connect", fake_connect)
     monkeypatch.setattr(cli, "Keystore", FakeKeystore())
@@ -1379,7 +1412,10 @@ def test_pin_reaches_the_second_connection_bootstrap_makes(
 ) -> None:
     # `bootstrap` reconnects after the device reboots into its new firmware;
     # that connection needs the option just as much as the first one.
-    first = FakeLink(services=frozenset({MI_AUTH_SERVICE, OTA_SERVICE}))
+    first = FakeLink(
+        services=frozenset({MI_AUTH_SERVICE, OTA_SERVICE}),
+        characteristics=frozenset({MI_AUTH_CONTROL_CHAR}),
+    )
     second = FakeLink(services=frozenset({CUSTOM_SERVICE}))
     fake_connect = FakeConnect(first, second)
     monkeypatch.setattr(cli, "connect", fake_connect)

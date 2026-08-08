@@ -28,7 +28,12 @@ from bleak import BleakError
 
 from . import config as config_module
 from . import firmware, ota, reader
-from .constants import CUSTOM_SERVICE, MI_AUTH_SERVICE, OTA_SERVICE, AdvertisingType
+from .constants import (
+    CUSTOM_SERVICE,
+    MI_AUTH_CONTROL_CHAR,
+    OTA_SERVICE,
+    AdvertisingType,
+)
 from .errors import Error, TransportError
 from .keystore import Keystore, bindkeys, normalise
 from .miauth import MiAuth, MiKeys
@@ -257,6 +262,16 @@ class ScanRow:
         return f"{self.address}  {rssi} dBm  {self.name or '?':<16} {fmt:<8} {summary}"
 
 
+def has_mi_auth(link: Link) -> bool:
+    """Whether the stock firmware's Xiaomi authentication is on offer.
+
+    The FE95 service's presence cannot answer this: the pvvx firmware keeps a
+    bare declaration of the same service, with no characteristics in it, so
+    only the control characteristic tells stock firmware apart.
+    """
+    return link.has_characteristic(MI_AUTH_CONTROL_CHAR)
+
+
 async def cmd_info(args: argparse.Namespace) -> int:
     async with open_link(args) as link:
         info = await link.device_info()
@@ -266,7 +281,7 @@ async def cmd_info(args: argparse.Namespace) -> int:
             "hardware_revision": info.hardware_revision,
             "software_revision": info.software_revision,
             "hardware_id": info.hardware_id,
-            "stock_firmware": link.has_service(MI_AUTH_SERVICE),
+            "stock_firmware": has_mi_auth(link),
             "custom_firmware": link.has_service(CUSTOM_SERVICE),
             "ota": link.has_service(OTA_SERVICE),
         }
@@ -320,8 +335,11 @@ async def cmd_activate(args: argparse.Namespace) -> int:
 
 
 async def activate(link: Link) -> MiKeys:
-    if not link.has_service(MI_AUTH_SERVICE):
-        msg = "device does not offer the Xiaomi authentication service"
+    if not has_mi_auth(link):
+        msg = (
+            "device does not offer the Xiaomi authentication characteristics; "
+            "it is not running stock firmware"
+        )
         raise Error(msg)
     auth = MiAuth(link)
     await auth.open()
@@ -336,7 +354,7 @@ async def cmd_flash(args: argparse.Namespace) -> int:
 
 async def flash(link: Link, args: argparse.Namespace, *, login_first: bool) -> None:
     """Install firmware, logging in first if the device is still stock."""
-    if login_first and link.has_service(MI_AUTH_SERVICE):
+    if login_first and has_mi_auth(link):
         store = Keystore.open(args.keys)
         known = store.get(link.address)
         if known is None:

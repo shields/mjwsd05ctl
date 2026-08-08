@@ -28,6 +28,13 @@ implementation of the Xiaomi handshake. Specifically:
 
 - The Telink image header's CRC-32 is `zlib.crc32(data) ^ 0xFFFFFFFF`. A plain
   `zlib.crc32` rejects every real image.
+- The pvvx firmware keeps a decoy FE95 service: its GATT table ends with a bare
+  primary-service declaration and a "Mi" user description (`app_att.c`), no
+  characteristics. So the service's presence cannot tell stock from pvvx —
+  the reference flasher keys "Detected Mi device" off the vendor service
+  `ebe0ccb0-…` instead, and `cli.has_mi_auth` checks for the 0x0010 control
+  characteristic itself. Flashing a converted device with the service check in
+  place dies in `MiAuth.open` on the missing characteristic.
 - Encrypted BTHome advertisements from this firmware use **no** associated data,
   though [bthome.io](https://bthome.io/format/) specifies `0x11`. The pvvx and
   ATC formats do use `0x11`, and put the address in the nonce reversed, where
