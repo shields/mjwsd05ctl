@@ -26,6 +26,7 @@ dependencies = [
   "construct>=2.10.70",
   "cryptography>=50.0.0",
   "pycryptodome>=3.23.0",
+  "tqdm>=4.70.0",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +43,7 @@ dev = [
   "pytest-cov>=7.1.0",
   "ruff>=0.16.1",
   "ty>=0.0.65",
+  "types-tqdm>=4.70.0.20260805",
 ]
 
 [build-system]

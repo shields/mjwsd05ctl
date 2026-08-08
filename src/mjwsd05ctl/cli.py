@@ -17,6 +17,7 @@
 import argparse
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import sys
@@ -25,6 +26,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from bleak import BleakError
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from . import config as config_module
 from . import firmware, ota, reader
@@ -369,16 +372,24 @@ async def flash(link: Link, args: argparse.Namespace, *, login_first: bool) -> N
 
     info = await link.device_info()
     image = firmware.resolve(info.hardware_id, args.firmware)
-    await ota.update(link, image, hardware_id=info.hardware_id, progress=_progress)
-    if sys.stderr.isatty():
-        print(file=sys.stderr)
+    # `disable=None` shows the bar only when stderr is a terminal. The log
+    # lines `ota` emits share that stream, so they must be redirected through
+    # the bar or they splice into its carriage-return redraws.
+    with (
+        logging_redirect_tqdm(),
+        tqdm(desc="Flashing", unit="block", disable=None) as bar,
+    ):
+        await ota.update(
+            link,
+            image,
+            hardware_id=info.hardware_id,
+            progress=functools.partial(_progress, bar),
+        )
 
 
-def _progress(done: int, total: int) -> None:
-    if not sys.stderr.isatty():
-        return
-    percent = done * 100 // total
-    print(f"\rFlashing: {percent:3d}% ({done}/{total} blocks)", end="", file=sys.stderr)
+def _progress(bar: tqdm, done: int, total: int) -> None:
+    bar.total = total
+    bar.update(done - bar.n)
 
 
 async def cmd_bootstrap(args: argparse.Namespace) -> int:

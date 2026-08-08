@@ -14,6 +14,7 @@
 
 import argparse
 import contextlib
+import io
 import json
 import logging
 import sys
@@ -25,6 +26,7 @@ from typing import Any, Self
 
 import pytest
 from bleak import AdvertisementData, BLEDevice
+from tqdm import tqdm
 
 from mjwsd05ctl import cli, config
 from mjwsd05ctl.constants import (
@@ -426,8 +428,14 @@ class FakeOTAModule:
     ) -> None:
         self.calls.append((link, image))
         self.hardware_ids.append(hardware_id)
+        # The real module logs around the transfer, and those lines share
+        # stderr with the progress bar; keeping the fake's shape the same
+        # lets the flash tests pin how the two interleave.
+        ota_log = logging.getLogger("mjwsd05ctl.ota")
+        ota_log.info("sending 8 blocks")
         if progress is not None:
             progress(4, 8)
+        ota_log.info("sent 8 blocks")
 
 
 class FakeFirmwareModule:
@@ -866,8 +874,14 @@ def test_activate_refuses_a_device_without_xiaomi_authentication(
 
 
 def test_flash_command_skips_activation_when_asked(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # Under pytest the root logger already has a capture handler, so `main`'s
+    # `basicConfig` is a no-op and the root level stays at WARNING; raise it
+    # so the fake's INFO lines reach the bar's redirect handler.
+    caplog.set_level(logging.INFO)
     info = DeviceInfo(
         firmware_revision=None, hardware_revision=None, software_revision=None
     )
@@ -887,12 +901,26 @@ def test_flash_command_skips_activation_when_asked(
     # The update needs the hardware id too: it decides how large an image the
     # ordinary slot can take, and so whether the extended area has to be erased.
     assert fake_ota.hardware_ids == [HW_ID_CH]
-    assert capsys.readouterr().err == "\rFlashing:  50% (4/8 blocks)\n"
+    # tqdm's exact rendering varies with timing and terminal width, so pin only
+    # the parts the progress callback determines.
+    err = capsys.readouterr().err
+    assert "Flashing" in err
+    assert " 50%" in err
+    assert "4/8" in err
+    assert err.endswith("\n")
+    # The log lines must go through the bar, which clears the line before
+    # emitting them; unredirected, they would be glued to the bar's text.
+    assert "\rsending 8 blocks\n" in err
+    assert "\rsent 8 blocks\n" in err
 
 
 def test_flash_logs_in_with_saved_keys_before_updating(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
 ) -> None:
+    caplog.set_level(logging.INFO)
     link = make_stock_link()
     monkeypatch.setattr(cli, "connect", FakeConnect(link))
     fake_keystore = FakeKeystore()
@@ -911,7 +939,9 @@ def test_flash_logs_in_with_saved_keys_before_updating(
     assert instances[0].opened is True
     assert instances[0].logged_in_with == KEYS.token
     assert fake_ota.calls == [(link, image)]
-    assert capsys.readouterr().err == ""  # stderr is not a tty under capsys
+    # stderr is not a tty under capsys, so the bar stays invisible and the
+    # redirected log lines pass through untouched.
+    assert capsys.readouterr().err == "sending 8 blocks\nsent 8 blocks\n"
     # `--keys` must reach `Keystore.open`, not just get parsed and dropped.
     assert fake_keystore.opened_with == [keys_path]
 
@@ -1538,17 +1568,14 @@ def test_read_publishes_each_reading_to_mqtt(
     assert publisher.published == [reading]
 
 
-def test_progress_reports_percentage_when_stderr_is_a_terminal(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
-    cli._progress(3, 10)
-    assert capsys.readouterr().err == "\rFlashing:  30% (3/10 blocks)"
-
-
-def test_progress_stays_silent_when_stderr_is_not_a_terminal(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
-    cli._progress(3, 10)
-    assert capsys.readouterr().err == ""
+def test_progress_advances_the_bar_by_the_delta() -> None:
+    # The callback carries a cumulative count, tqdm counts increments; feeding
+    # `done` straight to `update` would race ahead of the true position.
+    out = io.StringIO()
+    with tqdm(file=out, mininterval=0) as bar:
+        cli._progress(bar, 3, 10)
+        assert (bar.n, bar.total) == (3, 10)
+        cli._progress(bar, 4, 10)
+        assert (bar.n, bar.total) == (4, 10)
+    assert " 30%" in out.getvalue()
+    assert " 40%" in out.getvalue()
