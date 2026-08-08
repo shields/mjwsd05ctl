@@ -22,6 +22,7 @@ import json
 import logging
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -572,7 +573,14 @@ async def cmd_read(args: argparse.Namespace) -> int:
     )
 
     def emit(reading: reader.Reading) -> None:
-        print(reading.as_json() if args.json else _format(reading), flush=True)
+        received_at = _received_at()
+        if args.json:
+            payload = reading.as_dict()
+            payload["received_at"] = received_at
+            output = json.dumps(payload, sort_keys=True)
+        else:
+            output = _format(reading, received_at)
+        print(output, flush=True)
         if publisher is not None:
             publisher.publish(reading)
 
@@ -583,10 +591,14 @@ async def cmd_read(args: argparse.Namespace) -> int:
     return 0
 
 
-def _format(reading: reader.Reading) -> str:
+def _received_at() -> str:
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _format(reading: reader.Reading, received_at: str) -> str:
     body = " ".join(f"{name}={value}" for name, value in reading.values.items())
     suffix = f" [{reading.error}]" if reading.error else ""
-    return f"{reading.address} {reading.format:<8} {body}{suffix}"
+    return f"{received_at} {reading.address} {reading.format:<8} {body}{suffix}"
 
 
 if __name__ == "__main__":

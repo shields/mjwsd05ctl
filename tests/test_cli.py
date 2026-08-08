@@ -20,6 +20,7 @@ import logging
 import sys
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Self
@@ -1467,12 +1468,27 @@ def test_pin_reaches_the_second_connection_bootstrap_makes(
 
 # --- read --------------------------------------------------------------
 
+RECEIVED_AT = "2026-08-08T19:23:45.678Z"
+
+
+def test_receive_timestamps_are_iso_8601_utc_with_millisecond_precision() -> None:
+    timestamp = cli._received_at()
+    parsed = datetime.fromisoformat(timestamp)
+
+    assert parsed.tzinfo == UTC
+    assert timestamp.endswith("Z")
+    assert len(timestamp) == len(RECEIVED_AT)
+
 
 def test_format_pads_the_type_column_and_appends_errors() -> None:
     ok = Reading("A4:C1:38:00:00:01", "pvvx", {"temperature": 21.5})
-    assert cli._format(ok) == "A4:C1:38:00:00:01 pvvx     temperature=21.5"
+    assert cli._format(ok, RECEIVED_AT) == (
+        "2026-08-08T19:23:45.678Z A4:C1:38:00:00:01 pvvx     temperature=21.5"
+    )
     bad = Reading("A4:C1:38:00:00:02", "mi", {}, error="decryption: no key")
-    assert cli._format(bad) == "A4:C1:38:00:00:02 mi        [decryption: no key]"
+    assert cli._format(bad, RECEIVED_AT) == (
+        "2026-08-08T19:23:45.678Z A4:C1:38:00:00:02 mi        [decryption: no key]"
+    )
 
 
 def test_read_prints_decoded_lines_as_text(
@@ -1482,6 +1498,8 @@ def test_read_prints_decoded_lines_as_text(
     bad = Reading("A4:C1:38:00:00:02", "mi", {}, error="decryption: no key")
     fake_reader = make_reader_module(watcher_readings=[ok, bad])
     monkeypatch.setattr(cli, "reader", fake_reader)
+    received = iter([RECEIVED_AT, "2026-08-08T19:23:46.789Z"])
+    monkeypatch.setattr(cli, "_received_at", lambda: next(received))
 
     assert (
         cli.main(["--keys", str(tmp_path / "keys.json"), "read", "--duration", "0"])
@@ -1489,7 +1507,10 @@ def test_read_prints_decoded_lines_as_text(
     )
 
     lines = capsys.readouterr().out.splitlines()
-    assert lines == [cli._format(ok), cli._format(bad)]
+    assert lines == [
+        cli._format(ok, RECEIVED_AT),
+        cli._format(bad, "2026-08-08T19:23:46.789Z"),
+    ]
     watcher = fake_reader.watchers[0]
     assert watcher.duration == 0.0
     assert watcher.kwargs["passive"] is False
@@ -1532,13 +1553,22 @@ def test_read_passes_passive_and_normalised_addresses_to_the_watcher(
 def test_read_prints_decoded_readings_as_json(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    reading = Reading("A4:C1:38:00:00:01", "bthome", {"humidity": 55}, rssi=-60)
+    reading = Reading(
+        "A4:C1:38:00:00:01",
+        "bthome",
+        {"humidity": 55, "timestamp": 1786233600},
+        rssi=-60,
+    )
     monkeypatch.setattr(cli, "reader", make_reader_module(watcher_readings=[reading]))
+    monkeypatch.setattr(cli, "_received_at", lambda: RECEIVED_AT)
 
     assert cli.main(["--json", "--keys", str(tmp_path / "keys.json"), "read"]) == 0
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload == json.loads(reading.as_json())
+    assert payload == json.loads(reading.as_json()) | {"received_at": RECEIVED_AT}
+    # BTHome object 0x50 is the device's own timestamp. The host receive time
+    # must not overwrite it.
+    assert payload["timestamp"] == 1786233600
 
 
 def test_read_publishes_each_reading_to_mqtt(

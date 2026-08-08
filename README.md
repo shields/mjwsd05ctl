@@ -60,7 +60,9 @@ mjwsd05ctl read --mqtt mqtt://broker.local
 `read` never connects to anything: it decodes broadcast advertisements, so it
 scales to as many devices as are in range. The firmware rebroadcasts each
 measurement over several advertising events — redundancy against loss, since
-broadcasts are unacknowledged — and `read` reports each measurement once.
+broadcasts are unacknowledged — and `read` reports each measurement once. Each
+line starts with the receive time in ISO 8601 UTC; JSON output carries the same
+time as `received_at`.
 An advertisement that cannot be decoded (no bind key known, say) is reported
 every time it is heard, since without the plaintext counter a rebroadcast and
 a new failure look alike; `--duplicates` reports every advertisement received.
