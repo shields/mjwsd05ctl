@@ -194,6 +194,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="passive scanning, which needs BlueZ and a recent kernel",
     )
+    read_parser.add_argument(
+        "--duplicates",
+        action="store_true",
+        help="report every advertisement, not one per measurement",
+    )
     read_parser.add_argument("--mqtt", help="broker URL to publish to")
     read_parser.add_argument("--topic-prefix", default="mjwsd05ctl")
     read_parser.set_defaults(handler=cmd_read)
@@ -563,6 +568,7 @@ async def cmd_read(args: argparse.Namespace) -> int:
         adapter=args.adapter,
         passive=args.passive,
         addresses=frozenset(normalise(a) for a in args.address),
+        deduplicate=not args.duplicates,
     )
 
     def emit(reading: reader.Reading) -> None:

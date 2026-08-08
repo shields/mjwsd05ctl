@@ -533,24 +533,43 @@ def decode(
 
 @dataclass
 class Watcher:
-    """Scans continuously, decoding what it recognises."""
+    """Scans continuously, decoding what it recognises.
+
+    The firmware broadcasts each measurement over several advertising events —
+    four, with default settings — so the same reading arrives repeatedly.
+    `deduplicate` drops a reading identical to the previous one from the same
+    device; every format this firmware sends carries a counter that
+    distinguishes consecutive measurements, so only rebroadcasts are dropped.
+    Readings that could not be decoded keep repeating: an error worth
+    reporting once is worth reporting still being true.
+    """
 
     bindkeys: Mapping[str, bytes] = field(default_factory=dict)
     adapter: str | None = None
     passive: bool = False
     addresses: frozenset[str] = frozenset()
+    deduplicate: bool = True
 
     async def run(
         self, on_reading: ReadingCallback, *, duration: float | None = None
     ) -> None:
         """Watch until `duration` elapses, or forever if it is None."""
+        last: dict[str, tuple[str, dict[str, Value]]] = {}
 
         def detected(device: BLEDevice, advertisement: AdvertisementData) -> None:
             if self.addresses and device.address.upper() not in self.addresses:
                 return
             reading = decode(device, advertisement, self.bindkeys)
-            if reading is not None:
-                on_reading(reading)
+            if reading is None:
+                return
+            if self.deduplicate and reading.error is None:
+                # A snapshot, not the reading's own dict: the callback is
+                # handed that one and may mutate it.
+                key = (reading.format, dict(reading.values))
+                if last.get(reading.address) == key:
+                    return
+                last[reading.address] = key
+            on_reading(reading)
 
         bluez = BlueZScannerArgs()
         if self.adapter:

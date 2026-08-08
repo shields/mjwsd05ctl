@@ -58,7 +58,12 @@ mjwsd05ctl read --mqtt mqtt://broker.local
 ```
 
 `read` never connects to anything: it decodes broadcast advertisements, so it
-scales to as many devices as are in range.
+scales to as many devices as are in range. The firmware rebroadcasts each
+measurement over several advertising events — redundancy against loss, since
+broadcasts are unacknowledged — and `read` reports each measurement once.
+An advertisement that cannot be decoded (no bind key known, say) is reported
+every time it is heard, since without the plaintext counter a rebroadcast and
+a new failure look alike; `--duplicates` reports every advertisement received.
 
 `info` asks the device for its own Bluetooth address, which is worth having on
 macOS, where CoreBluetooth will not tell you what it is.

@@ -1494,6 +1494,7 @@ def test_read_prints_decoded_lines_as_text(
     assert watcher.duration == 0.0
     assert watcher.kwargs["passive"] is False
     assert watcher.kwargs["addresses"] == frozenset()
+    assert watcher.kwargs["deduplicate"] is True
 
 
 def test_read_passes_passive_and_normalised_addresses_to_the_watcher(
@@ -1509,6 +1510,7 @@ def test_read_passes_passive_and_normalised_addresses_to_the_watcher(
                 str(tmp_path / "keys.json"),
                 "read",
                 "--passive",
+                "--duplicates",
                 "--address",
                 "a4:c1:38:00:00:01",
                 "--address",
@@ -1524,6 +1526,7 @@ def test_read_passes_passive_and_normalised_addresses_to_the_watcher(
     watcher = fake_reader.watchers[0]
     assert watcher.kwargs["passive"] is True
     assert watcher.kwargs["addresses"] == {"A4:C1:38:00:00:01", "A4:C1:38:00:00:02"}
+    assert watcher.kwargs["deduplicate"] is False
 
 
 def test_read_prints_decoded_readings_as_json(

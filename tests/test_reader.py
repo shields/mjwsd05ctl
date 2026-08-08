@@ -650,8 +650,8 @@ WATCHER_ADDRESS_A = "A4:C1:38:00:00:01"
 WATCHER_ADDRESS_B = "A4:C1:38:00:00:02"
 
 
-def _pvvx_payload() -> bytes:
-    return struct.pack("<6shHHBBB", MAC_LE, 2137, 4512, 2980, 87, 42, 0)
+def _pvvx_payload(counter: int = 42) -> bytes:
+    return struct.pack("<6shHHBBB", MAC_LE, 2137, 4512, 2980, 87, counter, 0)
 
 
 async def test_watcher_run_only_reports_addresses_on_the_allowlist(
@@ -717,3 +717,107 @@ async def test_watcher_run_uses_or_patterns_only_in_passive_mode(
     assert scanner.scanning_mode == "passive"
     assert scanner.bluez["adapter"] == "hci1"
     assert scanner.bluez["or_patterns"] == reader._or_patterns()
+
+
+async def test_watcher_run_drops_rebroadcasts_of_the_same_measurement(
+    fake_scanner: type[FakeBleakScanner],
+) -> None:
+    # The firmware sends each measurement in several advertising events; the
+    # counter is what tells a new measurement from a rebroadcast.
+    fake_scanner.feed = [
+        advertisement(ATC_SERVICE, _pvvx_payload(counter=42)),
+        advertisement(ATC_SERVICE, _pvvx_payload(counter=42)),
+        advertisement(ATC_SERVICE, _pvvx_payload(counter=43)),
+    ]
+    seen: list[reader.Reading] = []
+    await reader.Watcher().run(seen.append, duration=0)
+
+    assert [r.values["counter"] for r in seen] == [42, 43]
+
+
+async def test_watcher_run_reports_rebroadcasts_when_deduplication_is_off(
+    fake_scanner: type[FakeBleakScanner],
+) -> None:
+    fake_scanner.feed = [
+        advertisement(ATC_SERVICE, _pvvx_payload()),
+        advertisement(ATC_SERVICE, _pvvx_payload()),
+    ]
+    seen: list[reader.Reading] = []
+    await reader.Watcher(deduplicate=False).run(seen.append, duration=0)
+
+    assert [r.values["counter"] for r in seen] == [42, 42]
+
+
+async def test_watcher_run_deduplicates_each_device_separately(
+    fake_scanner: type[FakeBleakScanner],
+) -> None:
+    # A rebroadcast is still a rebroadcast when another device's reading
+    # arrived in between; comparing against the last reading from anywhere
+    # would let the third advertisement through.
+    payload = _pvvx_payload()
+    fake_scanner.feed = [
+        advertisement(ATC_SERVICE, payload, address=WATCHER_ADDRESS_A),
+        advertisement(ATC_SERVICE, payload, address=WATCHER_ADDRESS_B),
+        advertisement(ATC_SERVICE, payload, address=WATCHER_ADDRESS_A),
+    ]
+    seen: list[reader.Reading] = []
+    await reader.Watcher().run(seen.append, duration=0)
+
+    assert [r.address for r in seen] == [WATCHER_ADDRESS_A, WATCHER_ADDRESS_B]
+
+
+async def test_watcher_run_treats_a_format_change_as_a_new_reading(
+    fake_scanner: type[FakeBleakScanner], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No two real decoders produce the same values dict, so the format half
+    # of the deduplication key is exercised with a fake decode: the same
+    # values arriving under a new format are not a rebroadcast.
+    readings = iter(
+        [
+            reader.Reading(ADDRESS, "pvvx", {"temperature": 21.5}),
+            reader.Reading(ADDRESS, "atc1441", {"temperature": 21.5}),
+        ]
+    )
+    monkeypatch.setattr(reader, "decode", lambda *_args: next(readings))
+    fake_scanner.feed = [advertisement(ATC_SERVICE, _pvvx_payload())] * 2
+    seen: list[reader.Reading] = []
+    await reader.Watcher().run(seen.append, duration=0)
+
+    assert [r.format for r in seen] == ["pvvx", "atc1441"]
+
+
+async def test_watcher_run_deduplication_survives_a_callback_that_mutates(
+    fake_scanner: type[FakeBleakScanner],
+) -> None:
+    # The callback is handed the reading's own values dict; deduplication
+    # compares a snapshot, so mutating it must not let the rebroadcast in.
+    fake_scanner.feed = [
+        advertisement(ATC_SERVICE, _pvvx_payload()),
+        advertisement(ATC_SERVICE, _pvvx_payload()),
+    ]
+    seen: list[reader.Reading] = []
+
+    def enrich(reading: reader.Reading) -> None:
+        seen.append(reading)
+        reading.values["fahrenheit"] = 70.7
+
+    await reader.Watcher().run(enrich, duration=0)
+
+    assert len(seen) == 1
+
+
+async def test_watcher_run_keeps_repeating_undecodable_readings(
+    fake_scanner: type[FakeBleakScanner],
+) -> None:
+    # An encrypted beacon with no key known is reported every time it is
+    # heard: the failure is still true, and there is no plaintext counter to
+    # tell a rebroadcast from a new measurement anyway.
+    payload = bytes([reader.BTHOME_ENCRYPTED_FLAG]) + bytes(12)
+    fake_scanner.feed = [
+        advertisement(BTHOME_SERVICE, payload),
+        advertisement(BTHOME_SERVICE, payload),
+    ]
+    seen: list[reader.Reading] = []
+    await reader.Watcher().run(seen.append, duration=0)
+
+    assert [r.error for r in seen] == ["no bind key known", "no bind key known"]
