@@ -46,9 +46,9 @@ from .errors import TransportError
 log = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 30.0
-DEFAULT_SCAN_TIMEOUT = 10.0
+DEFAULT_SCAN_TIMEOUT = 20.0
 CONNECT_ATTEMPTS = 3
-NOTIFY_TIMEOUT = 10.0
+NOTIFY_TIMEOUT = 20.0
 
 # Devices advertise under several names depending on firmware: the stock name,
 # the pvvx default, and whatever the user has since set.
