@@ -159,6 +159,25 @@ def test_matches_falls_back_to_the_cached_device_name_when_unadvertised() -> Non
     assert transport._matches(device, advertisement)
 
 
+@pytest.mark.parametrize("name", ["BTH_51CD84", "BTH_1"])
+def test_matches_accepts_the_name_the_flashed_firmware_gives_itself(name: str) -> None:
+    # `ble_set_name()` derives "BTH_<n>" from the fleet device number, falling
+    # back to the last three bytes of the address. Without this prefix `scan`
+    # and every address-less command are blind to the firmware this package
+    # installs, which is how a successful flash came to look like a brick.
+    device, advertisement = seen("A4:C1:38:51:CD:84", name, -50)
+    assert transport._matches(device, advertisement)
+
+
+def test_matches_requires_the_full_bth_prefix() -> None:
+    # Both parametrized cases above start with "BTH", not just "BTH_" — on
+    # their own they cannot tell a trailing-underscore typo in NAME_PREFIXES
+    # from a correct one, and a bare "BTH" would also catch unrelated
+    # products (a "BTHub", say) that happen to share the first three letters.
+    device, advertisement = seen("A4:C1:38:51:CD:84", "BTHomeOther", -50)
+    assert not transport._matches(device, advertisement)
+
+
 def test_matches_is_false_when_no_name_is_available_anywhere() -> None:
     device = BLEDevice("A4:C1:38:00:00:01", None, None)
     advertisement = AdvertisementData(
@@ -320,11 +339,20 @@ class FakeServices:
         self._characteristics = {
             uuid: FakeCharacteristic(uuid) for uuid in characteristic_uuids
         }
+        self._error: Exception | None = None
+
+    def fail(self, error: Exception) -> None:
+        """Simulate Bleak's discarded-on-disconnect service cache."""
+        self._error = error
 
     def __iter__(self) -> Iterator[FakeService]:
+        if self._error is not None:
+            raise self._error
         return iter(self._services)
 
     def get_characteristic(self, uuid: str) -> FakeCharacteristic | None:
+        if self._error is not None:
+            raise self._error
         return self._characteristics.get(uuid)
 
 
@@ -354,8 +382,11 @@ class FakeGATTClient:
         self.connect_calls = 0
         self.disconnect_calls = 0
         self.notify_calls: list[str] = []
+        self.notify_error: Exception | None = None
 
     async def start_notify(self, uuid: str, handler: NotifyHandler) -> None:
+        if self.notify_error is not None:
+            raise self.notify_error
         self._notify_handlers[uuid] = handler
         self.notify_calls.append(uuid)
 
@@ -489,6 +520,41 @@ def test_has_service_and_has_characteristic_reflect_the_gatt_table() -> None:
     assert not link.has_characteristic(CUSTOM_CHAR)
 
 
+@pytest.mark.parametrize(
+    ("method", "uuid"),
+    [("has_service", CUSTOM_SERVICE), ("has_characteristic", CUSTOM_CHAR)],
+)
+def test_has_service_and_has_characteristic_report_a_dropped_link(
+    method: str, uuid: str
+) -> None:
+    # Both reach `self._client.services`, exactly what `write()` was given a
+    # fast disconnect check for; without the same check here, a device that
+    # dropped moments after connecting (the flaky window `bootstrap`'s
+    # post-reboot retry loop exists to ride out) surfaces as a raw BleakError
+    # instead of the TransportError callers actually handle.
+    dropped = asyncio.Event()
+    dropped.set()
+    client = FakeGATTClient()
+    link = transport.Link(client, dropped)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(TransportError, match="device disconnected"):
+        getattr(link, method)(uuid)
+
+
+@pytest.mark.parametrize(
+    ("method", "uuid"),
+    [("has_service", CUSTOM_SERVICE), ("has_characteristic", CUSTOM_CHAR)],
+)
+def test_has_service_and_has_characteristic_translate_a_lost_service_cache(
+    method: str, uuid: str
+) -> None:
+    # The same loss, but reached before the disconnect callback has landed.
+    client = FakeGATTClient()
+    client.services.fail(BleakError("Service Discovery has not been performed yet"))
+    link = transport.Link(client)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(TransportError, match="Service Discovery"):
+        getattr(link, method)(uuid)
+
+
 async def test_subscribe_enqueues_notifications_as_they_arrive() -> None:
     client = FakeGATTClient()
     link = transport.Link(client)  # ty: ignore[invalid-argument-type]
@@ -513,6 +579,39 @@ async def test_ensure_subscribed_subscribes_when_nobody_has_yet() -> None:
     client.notify(CUSTOM_CHAR, b"\x99")
     assert await queue.get() == b"\x99"
     assert client.notify_calls == [CUSTOM_CHAR]
+
+
+async def test_subscribe_reports_a_dropped_link_as_a_disconnect() -> None:
+    # `Session.open` subscribes immediately after checking for its
+    # characteristic, and `cmd_bootstrap`'s post-reboot loop retries only on
+    # TransportError. A bare BleakError from here would escape that loop and
+    # abort after one attempt, defeating the retry it exists for.
+    dropped = asyncio.Event()
+    dropped.set()
+    client = FakeGATTClient(characteristic_uuids=[CUSTOM_CHAR])
+    link = transport.Link(client, dropped)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(TransportError, match="device disconnected"):
+        await link.subscribe(CUSTOM_CHAR)
+    assert client.notify_calls == []
+
+
+async def test_subscribe_translates_a_bleak_error_into_a_transport_error() -> None:
+    # The narrower race: the drop is discovered only by start_notify itself,
+    # which refuses with "Not connected" before it reaches the backend.
+    client = FakeGATTClient(characteristic_uuids=[CUSTOM_CHAR])
+    client.notify_error = BleakError("Not connected")
+    link = transport.Link(client)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(TransportError, match="Not connected"):
+        await link.subscribe(CUSTOM_CHAR)
+
+
+async def test_subscribe_tagged_translates_a_bleak_error_too() -> None:
+    # The Xiaomi handshake subscribes through this path rather than subscribe().
+    client = FakeGATTClient()
+    client.notify_error = BleakError("Not connected")
+    link = transport.Link(client)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(TransportError, match="could not subscribe"):
+        await link.subscribe_tagged((MI_AUTH_CONTROL_CHAR, MI_AUTH_DATA_CHAR))
 
 
 async def test_ensure_subscribed_reuses_an_existing_subscription() -> None:
@@ -578,6 +677,43 @@ async def test_write_translates_a_bleak_error_into_a_transport_error() -> None:
     link = transport.Link(client)  # ty: ignore[invalid-argument-type]
     with pytest.raises(TransportError, match="gatt busy"):
         await link.write(CUSTOM_CHAR, b"\x00")
+
+
+async def test_write_reports_a_dropped_link_as_a_disconnect() -> None:
+    # Stock firmware hangs up the moment an unauthenticated OTA starts. Bleak
+    # discards its service cache on disconnect, so resolving the write type is
+    # the first thing to fail afterwards, with "Service Discovery has not been
+    # performed yet" — a message that sends the reader looking for a fault here
+    # instead of telling them the device refused.
+    dropped = asyncio.Event()
+    dropped.set()
+    client = FakeGATTClient(characteristic_uuids=[CUSTOM_CHAR])
+    link = transport.Link(client, dropped)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(TransportError, match="device disconnected"):
+        await link.write(CUSTOM_CHAR, b"\x55")
+    assert client.writes == []
+
+
+async def test_write_translates_a_lost_service_cache_into_a_transport_error() -> None:
+    # The same loss, but reached before the disconnect callback has landed.
+    client = FakeGATTClient()
+    client.services.fail(BleakError("Service Discovery has not been performed yet"))
+    link = transport.Link(client)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(TransportError, match="Service Discovery"):
+        await link.write(CUSTOM_CHAR, b"\x55")
+
+
+async def test_read_reports_a_dropped_link_as_a_disconnect() -> None:
+    # `read()` reaches `self._client.services` internally (via bleak's own
+    # `read_gatt_char`) exactly as `write()` does, and OTA's periodic status
+    # read sits in the same per-block loop as its now-fixed write — so it
+    # needs the same fast, clean disconnect check `write()` was given.
+    dropped = asyncio.Event()
+    dropped.set()
+    client = FakeGATTClient()
+    link = transport.Link(client, dropped)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(TransportError, match="device disconnected"):
+        await link.read(CUSTOM_CHAR)
 
 
 async def test_read_returns_the_characteristic_value() -> None:

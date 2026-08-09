@@ -78,6 +78,24 @@ When changing any of these, update the test that pins it. The tests derive
 expected values independently — HKDF written out by hand, ciphertext built the
 way the C builds it — so that a mistake cannot be made twice and cancel out.
 
+## Binding mode
+
+Registration has a precondition no amount of code satisfies: the thermometer
+must have had its previous binding cleared and be in binding mode, which on this
+model means holding both buttons until the screen blinks and the device resets,
+then a brief press of the top button and then the bottom one, until the
+Bluetooth icon flashes
+([pvvx/ATC_MiThermometer#505](https://github.com/pvvx/ATC_MiThermometer/issues/505)).
+
+A device that is not in binding mode does not say so. It answers
+`MI_CMD_REGISTER_START` with `000000000100`, asks to restart the exchange with
+`010001000000`, and then ignores the `000000030400` public-key announcement
+indefinitely — the link stays up and re-sending `a2000000` still draws a fresh
+reply, so only the one step is dead. `TelinkMiFlasher.html` sends the same bytes
+in the same order and hangs the same way, so a stall there is not evidence of a
+transcription error, and resends and longer settling times do not help. This is
+why `register` alone passes a hint to `_pump`.
+
 ## Hardware-free testing
 
 `tests/test_miauth.py` drives the registration and login state machines against

@@ -33,15 +33,33 @@ uv tool install mjwsd05ctl
 
 ## Use
 
-Take a factory-fresh device all the way to custom firmware in one step:
+### Provisioning a factory-fresh device
+
+Stock firmware ignores both registration and firmware updates unless the device
+is in binding mode. Put it there first:
+
+1. Hold **both** buttons until the screen blinks and the device resets.
+2. Briefly press the **top** button.
+3. Briefly press the **bottom** button — the Bluetooth icon starts flashing.
+
+While it is flashing, run `activate` or `bootstrap`; the latter takes the device
+all the way to custom firmware in one step:
 
 ```sh
 uv run mjwsd05ctl bootstrap --address A4:C1:38:XX:XX:XX
 ```
 
 That activates the device (recording its Mi token and bind key), flashes the
-matching firmware image, and applies a starting configuration. The individual
-steps are also available:
+matching firmware image, and applies a starting configuration.
+
+Skipping steps 2 and 3 is the usual reason this fails. The firmware refuses by
+falling silent part way through the handshake rather than by reporting an error,
+so the request is simply never answered and `activate` waits out its timeout.
+Updates are gated behind the same login, and `flash --skip-activation` does not
+get around it: stock firmware hangs up the moment an unauthenticated update
+starts.
+
+The individual steps are also available:
 
 ```sh
 uv run mjwsd05ctl scan                                  # find nearby devices
@@ -50,6 +68,8 @@ uv run mjwsd05ctl activate --address <mac>              # ECDH registration + lo
 uv run mjwsd05ctl flash --address <mac> --firmware BTH_v58.bin
 uv run mjwsd05ctl config --address <mac>                # show current settings
 uv run mjwsd05ctl config --address <mac> --set advertising_type=BTHome --set temp_F_or_C=0
+uv run mjwsd05ctl config --address <mac> --set-devnum 2 # fleet number; renames it BTH_2
+uv run mjwsd05ctl config --address <mac> --set-time --set-bindkey
 uv run mjwsd05ctl comfort --address <mac>               # the band the smiley reflects
 uv run mjwsd05ctl comfort --address <mac> --set temperature_min=19.5
 uv run mjwsd05ctl reboot --address <mac>
@@ -88,16 +108,16 @@ filed under an identifier no other machine shares, and pairing cannot be
 initiated.
 
 A factory-fresh device must be woken before it accepts a connection — hold both
-buttons until the display comes on. Stock firmware answers a registration only
-after a further arming sequence: hold both buttons until the screen blinks and
-the device resets, briefly press the top button, then the bottom one, and the
-Bluetooth icon starts flashing. Run `activate` or `bootstrap` while it is;
-without this, the registration request is simply never answered.
+buttons until the display comes on. Registration then needs the binding-mode
+sequence above.
 
-Once the pvvx firmware is on, the device advertises every five seconds and is
-most willing to accept a connection in the moments after it boots. A short
-press of the top button — its "connect" function — speeds advertising up and
-opens a window in which connecting is reliable.
+Once the pvvx firmware is on, the device renames itself `BTH_<n>` after its fleet
+device number, or `BTH_` and the last three bytes of its address if it has none,
+and `scan` reports it under that name. It advertises every five seconds and is
+most willing to accept a connection in the moments after it boots. A short press
+of the top button — its "connect" function — speeds advertising up and opens a
+window in which connecting is reliable; it is worth pressing before any command
+that has to connect, and after a flash, before the configuration commands above.
 
 ## Development
 

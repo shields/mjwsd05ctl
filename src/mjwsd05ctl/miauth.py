@@ -71,6 +71,20 @@ log = logging.getLogger(__name__)
 REGISTER_TIMEOUT = 60.0
 LOGIN_TIMEOUT = 60.0
 
+# A thermometer with buttons will not register until its previous binding has
+# been cleared and it has been put back into binding mode, and it refuses by
+# falling silent part way through the exchange rather than by reporting a
+# status: it answers the opening command, asks for the exchange to restart,
+# and then ignores the key-exchange announcement for as long as one waits
+# (pvvx/ATC_MiThermometer#505). Nothing the host sends recovers it, so the only
+# useful thing to say about a registration that times out is which buttons to
+# press. Login has no such precondition and gets no hint.
+BINDING_MODE_HINT = (
+    "hold both buttons until the screen blinks and the device resets, then "
+    "briefly press the top button and then the bottom one; registration only "
+    "works while the Bluetooth icon is flashing"
+)
+
 type _Handler = Callable[[bytes], Awaitable[None]]
 
 # The device pauses between accepting a command and being ready for the next.
@@ -239,6 +253,7 @@ class MiAuth:
         self._expected_proof = b""
         self._our_proof = b""
         self._received_proof = bytearray()
+        self._hint: str | None = None
 
     async def open(self) -> None:
         """Subscribe to both authentication characteristics."""
@@ -263,7 +278,7 @@ class MiAuth:
 
         log.info("registering; this replaces any existing Mi Home pairing")
         await self._control(MI_CMD_REGISTER_START)
-        await self._pump(self._handle_register, timeout=timeout)
+        await self._pump(self._handle_register, timeout=timeout, hint=BINDING_MODE_HINT)
         return MiKeys(
             token=self._token, bindkey=self._bindkey, device_id=self._device_id
         )
@@ -284,12 +299,23 @@ class MiAuth:
         await self._control(MI_CMD_LOGIN_START)
         await self._data(_ANNOUNCE_LOGIN)
 
-    async def _pump(self, handler: _Handler, *, timeout: float) -> None:
-        """Dispatch notifications until the device reports success or failure."""
+    async def _pump(
+        self, handler: _Handler, *, timeout: float, hint: str | None = None
+    ) -> None:
+        """Dispatch notifications until the device reports success or failure.
+
+        `hint` is appended to the timeout message when falling silent is a
+        known way for the device to refuse rather than a sign of a dead link.
+        It stops applying the moment `_handle_common` restarts the exchange as
+        a login, even if that happened inside a call that started as a
+        registration: from there on, a stall is a login problem, and blaming
+        binding mode would misdirect whoever reads the error.
+        """
         if self._events is None:
             msg = "MiAuth.open() must be called before registering or logging in"
             raise ActivationError(msg)
 
+        self._hint = hint
         try:
             async with asyncio.timeout(timeout):
                 while True:
@@ -303,6 +329,8 @@ class MiAuth:
                     await handler(value)
         except TimeoutError:
             msg = f"device did not respond within {timeout:g}s"
+            if self._hint is not None:
+                msg = f"{msg}; {self._hint}"
             raise ActivationError(msg) from None
 
     def _handle_status(self, value: bytes) -> bool:
@@ -331,6 +359,7 @@ class MiAuth:
         await self._data(_RELOGIN_REPLY + value[3:])
         if value[3] == _RELOGIN_REASON_LOGIN:
             await asyncio.sleep(SETTLE)
+            self._hint = None
             await self._begin_login()
         return True
 

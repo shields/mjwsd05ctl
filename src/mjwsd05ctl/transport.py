@@ -51,8 +51,12 @@ CONNECT_ATTEMPTS = 3
 NOTIFY_TIMEOUT = 20.0
 
 # Devices advertise under several names depending on firmware: the stock name,
-# the pvvx default, and whatever the user has since set.
-NAME_PREFIXES = (DEVICE_NAME, "ATC_")
+# the pvvx default, and whatever the user has since set. `ble_set_name()` builds
+# "BTH_<n>" from the fleet device number, or "BTH_" and the last three bytes of
+# the address when no number is assigned, so a freshly flashed device answers to
+# neither of the first two — leaving `scan` and every address-less command
+# unable to see the firmware this package exists to install.
+NAME_PREFIXES = (DEVICE_NAME, "ATC_", "BTH_")
 
 type NotifyHandler = Callable[[BleakGATTCharacteristic, bytearray], None]
 
@@ -100,11 +104,57 @@ class Link:
     def address(self) -> str:
         return self._client.address
 
+    def _check_connected(self) -> None:
+        """Raise TransportError if the link is already known to have dropped.
+
+        Every method below that touches `self._client.services` needs this:
+        Bleak discards its service cache on disconnect, so those accesses are
+        the first thing to fail once the device has gone, with a bare
+        BleakError ("Service Discovery has not been performed yet") that reads
+        like a bug here rather than what it is. Checking the flag we already
+        track catches the common case before Bleak's own message has a chance
+        to confuse anyone; each caller's `except BleakError` still covers the
+        narrower race where the drop is discovered only by the access itself.
+        """
+        if self._disconnected.is_set():
+            msg = "device disconnected"
+            raise TransportError(msg)
+
     def has_service(self, uuid: str) -> bool:
-        return any(service.uuid == uuid.lower() for service in self._client.services)
+        self._check_connected()
+        try:
+            return any(
+                service.uuid == uuid.lower() for service in self._client.services
+            )
+        except BleakError as exc:
+            msg = f"could not check for service {uuid}: {exc}"
+            raise TransportError(msg) from exc
 
     def has_characteristic(self, uuid: str) -> bool:
-        return self._client.services.get_characteristic(uuid) is not None
+        self._check_connected()
+        try:
+            return self._client.services.get_characteristic(uuid) is not None
+        except BleakError as exc:
+            msg = f"could not check for characteristic {uuid}: {exc}"
+            raise TransportError(msg) from exc
+
+    async def _start_notify(self, uuid: str, handler: NotifyHandler) -> None:
+        """Subscribe, reporting a dropped link the way the other methods do.
+
+        `start_notify` resolves the characteristic against Bleak's service
+        cache and refuses outright once the client knows it has disconnected,
+        so without this a drop here escapes as a bare BleakError — past, among
+        others, `cmd_bootstrap`'s `except TransportError` retry loop, which
+        exists precisely to ride out the post-reboot window in which a drop is
+        most likely. `Session.open` subscribes immediately after checking for
+        its characteristic, so both halves of it need the same treatment.
+        """
+        self._check_connected()
+        try:
+            await self._client.start_notify(uuid, handler)
+        except BleakError as exc:
+            msg = f"could not subscribe to {uuid}: {exc}"
+            raise TransportError(msg) from exc
 
     async def subscribe(self, uuid: str) -> asyncio.Queue[bytes]:
         """Enable notifications on a characteristic and return their queue."""
@@ -115,7 +165,7 @@ class Link:
             log.debug("notify %s <- %s", _short(uuid), bytes(data).hex())
             queue.put_nowait(bytes(data))
 
-        await self._client.start_notify(uuid, handler)
+        await self._start_notify(uuid, handler)
         return queue
 
     async def subscribe_tagged(
@@ -138,7 +188,7 @@ class Link:
             return handler
 
         for uuid in uuids:
-            await self._client.start_notify(uuid, make_handler(uuid))
+            await self._start_notify(uuid, make_handler(uuid))
         return merged
 
     async def take[T](self, queue: asyncio.Queue[T]) -> T:
@@ -202,21 +252,26 @@ class Link:
         The resolution to an explicit bool happens here rather than being left
         to Bleak, which deprecates omitting it; doing it locally also keeps the
         choice pinned by tests rather than inherited from a dependency.
+
+        Stock firmware hangs up the moment an unauthenticated OTA starts, which
+        is the case `_check_connected` exists for.
         """
-        if response is None:
-            char = self._client.services.get_characteristic(uuid)
-            if char is None:
-                response = True
-            else:
-                response = "write-without-response" not in char.properties
-        log.debug("write %s -> %s", _short(uuid), data.hex())
+        self._check_connected()
         try:
+            if response is None:
+                char = self._client.services.get_characteristic(uuid)
+                if char is None:
+                    response = True
+                else:
+                    response = "write-without-response" not in char.properties
+            log.debug("write %s -> %s", _short(uuid), data.hex())
             await self._client.write_gatt_char(uuid, data, response=response)
         except BleakError as exc:
             msg = f"write to {uuid} failed: {exc}"
             raise TransportError(msg) from exc
 
     async def read(self, uuid: str) -> bytes:
+        self._check_connected()
         try:
             value = bytes(await self._client.read_gatt_char(uuid))
         except BleakError as exc:

@@ -419,17 +419,68 @@ class SilentDevice(FakeDevice):
 
 
 async def test_an_unresponsive_device_raises_a_domain_error_not_a_timeout() -> None:
+    # Silence is how a device that has not been put into binding mode refuses,
+    # so the message has to name the buttons; a bare timeout sends the reader
+    # looking for a fault in this code, which is where an evening went.
     auth = MiAuth(FakeLink(SilentDevice()))  # ty: ignore[invalid-argument-type]
     await auth.open()
-    with pytest.raises(ActivationError, match="did not respond"):
+    with pytest.raises(ActivationError, match="did not respond") as raised:
         await auth.register(timeout=0.05)
+    assert "both buttons" in str(raised.value)
 
 
 async def test_an_unresponsive_device_fails_login_the_same_way() -> None:
+    # Login has no binding-mode precondition, so the same silence must not be
+    # blamed on the buttons. Pinned as an exact match, not just an absence of
+    # "both buttons": a weakened `is not None` guard around the hint would
+    # silently append the literal text "; None" to every login timeout, which
+    # a mere substring check would not catch.
     auth = MiAuth(FakeLink(SilentDevice()))  # ty: ignore[invalid-argument-type]
     await auth.open()
-    with pytest.raises(ActivationError, match="did not respond"):
+    with pytest.raises(ActivationError, match="did not respond") as raised:
         await auth.login(bytes(12), timeout=0.05)
+    assert str(raised.value) == "device did not respond within 0.05s"
+
+
+async def test_registration_times_out_with_the_hint_when_not_in_binding_mode() -> None:
+    # Pins the exact sequence AGENTS.md's "Binding mode" section documents,
+    # rather than SilentDevice's blanket silence: the device answers
+    # MI_CMD_REGISTER_START with "not activated," asks to restart, and then —
+    # because it was never put into binding mode — never answers the
+    # re-announced public key.
+    class NotInBindingMode(FakeDevice):
+        def handle_data(self, payload: bytes) -> None:
+            if payload == bytes.fromhex("000000030400") and self.phase == "prompted":
+                return
+            super().handle_data(payload)
+
+    auth = MiAuth(FakeLink(NotInBindingMode()))  # ty: ignore[invalid-argument-type]
+    await auth.open()
+    with pytest.raises(ActivationError, match="did not respond") as raised:
+        await auth.register(timeout=0.05)
+    assert "both buttons" in str(raised.value)
+
+
+async def test_a_login_restart_mid_registration_does_not_blame_binding_mode() -> None:
+    # `_handle_common` restarts the exchange as a login "in either mode" —
+    # including inside register()'s own pump, which is the only one that
+    # carries a binding-mode hint. If that login sub-exchange then stalls, the
+    # stall is a login problem, not the documented binding-mode refusal, so
+    # the hint must not fire.
+    class RestartsAsLoginDuringRegistration(FakeDevice):
+        def handle_control(self, payload: bytes) -> None:
+            if payload.hex() == "a2000000":
+                # Prefix "000004" plus reason byte 1: "please log in again."
+                self.data(bytes.fromhex("00000401"))
+                return
+            # Every other control message, including the login start this
+            # triggers, goes unanswered: the device has gone silent.
+
+    auth = MiAuth(FakeLink(RestartsAsLoginDuringRegistration()))  # ty: ignore[invalid-argument-type]
+    await auth.open()
+    with pytest.raises(ActivationError, match="did not respond") as raised:
+        await auth.register(timeout=0.05)
+    assert "both buttons" not in str(raised.value)
 
 
 async def test_login_without_open_is_an_error() -> None:
