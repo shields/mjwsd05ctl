@@ -36,7 +36,7 @@ uv tool install mjwsd05ctl
 Take a factory-fresh device all the way to custom firmware in one step:
 
 ```sh
-mjwsd05ctl bootstrap --address A4:C1:38:XX:XX:XX
+uv run mjwsd05ctl bootstrap --address A4:C1:38:XX:XX:XX
 ```
 
 That activates the device (recording its Mi token and bind key), flashes the
@@ -44,17 +44,17 @@ matching firmware image, and applies a starting configuration. The individual
 steps are also available:
 
 ```sh
-mjwsd05ctl scan                                  # find nearby devices
-mjwsd05ctl info --address <mac>                  # what the device reports
-mjwsd05ctl activate --address <mac>              # ECDH registration + login
-mjwsd05ctl flash --address <mac> --firmware BTH_v58.bin
-mjwsd05ctl config --address <mac>                # show current settings
-mjwsd05ctl config --address <mac> --set advertising_type=BTHome --set temp_F_or_C=0
-mjwsd05ctl comfort --address <mac>               # the band the smiley reflects
-mjwsd05ctl comfort --address <mac> --set temperature_min=19.5
-mjwsd05ctl reboot --address <mac>
-mjwsd05ctl read                                  # passive advertisement decode
-mjwsd05ctl read --mqtt mqtt://broker.local
+uv run mjwsd05ctl scan                                  # find nearby devices
+uv run mjwsd05ctl info --address <mac>                  # what the device reports
+uv run mjwsd05ctl activate --address <mac>              # ECDH registration + login
+uv run mjwsd05ctl flash --address <mac> --firmware BTH_v58.bin
+uv run mjwsd05ctl config --address <mac>                # show current settings
+uv run mjwsd05ctl config --address <mac> --set advertising_type=BTHome --set temp_F_or_C=0
+uv run mjwsd05ctl comfort --address <mac>               # the band the smiley reflects
+uv run mjwsd05ctl comfort --address <mac> --set temperature_min=19.5
+uv run mjwsd05ctl reboot --address <mac>
+uv run mjwsd05ctl read                                  # passive advertisement decode
+uv run mjwsd05ctl read --mqtt mqtt://broker.local
 ```
 
 `read` never connects to anything: it decodes broadcast advertisements, so it
@@ -67,8 +67,9 @@ An advertisement that cannot be decoded (no bind key known, say) is reported
 every time it is heard, since without the plaintext counter a rebroadcast and
 a new failure look alike; `--duplicates` reports every advertisement received.
 
-`info` asks the device for its own Bluetooth address, which is worth having on
-macOS, where CoreBluetooth will not tell you what it is.
+`info` asks the device for its own Bluetooth MAC address, which is worth having on
+macOS, where CoreBluetooth will not tell you what it is. `scan` will
+also report MAC addresses.
 
 Devices ship with no PIN and leave their characteristics unsecured, so nothing
 bonds by default. Once you have set a PIN, add `--pin` before the subcommand,
