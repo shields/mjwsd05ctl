@@ -211,6 +211,7 @@ class FakeLink:
         has_characteristic: bool = True,
         bindkey_missing: bool = False,
         mac_reply: bytes = bytes([len(MAC_STORED)]) + MAC_STORED,
+        unimplemented: frozenset[CommandId] = frozenset(),
     ) -> None:
         self.queue: asyncio.Queue[bytes] = asyncio.Queue()
         self.writes: list[bytes] = []
@@ -224,6 +225,10 @@ class FakeLink:
         # Simulates a device with no Xiaomi bind key stored: BKEY replies come
         # back short, rather than the usual 16 bytes.
         self.bindkey_missing = bindkey_missing
+        # Simulates a firmware build with no handler for these opcodes: they
+        # fall through cmd_parser.c's catch-all, which answers a bare 0xff
+        # error byte instead of the command's usual reply.
+        self.unimplemented = unimplemented
 
     def has_characteristic(self, uuid: str) -> bool:
         del uuid
@@ -272,6 +277,8 @@ class FakeLink:
             if self.duplicate_replies:
                 # As when a resend elicited a second answer to one command.
                 self.queue.put_nowait(answer)
+        elif command in self.unimplemented:
+            self.queue.put_nowait(bytes([command, 0xFF]))
         elif command == CommandId.UTC_TIME:
             self.queue.put_nowait(bytes([CommandId.UTC_TIME]) + request[1:5])
         elif command == CommandId.BKEY:
@@ -384,6 +391,14 @@ async def test_setting_the_clock_sends_local_time_as_if_it_were_utc() -> None:
     assert reported == expected_stamp
 
 
+async def test_set_time_returns_none_when_the_firmware_does_not_implement_it() -> None:
+    # A build with CMD_ID_UTC_TIME stripped falls through cmd_parser.c's
+    # catch-all, which answers a bare 0xff error byte, not a 4-byte stamp.
+    ses, link = await session(unimplemented=frozenset({CommandId.UTC_TIME}))
+    assert await ses.set_time() is None
+    assert link.writes[-1][0] == CommandId.UTC_TIME
+
+
 async def test_bind_key_round_trips() -> None:
     ses, _ = await session()
     key = bytes(range(16, 32))
@@ -469,6 +484,7 @@ async def test_set_mi_keys_rejects_a_token_or_bindkey_of_the_wrong_length() -> N
 async def test_comfort_reads_the_band_the_firmware_ships_with() -> None:
     ses, link = await session()
     zone = await ses.comfort()
+    assert zone is not None
     # A bare opcode is a read: the firmware only overwrites the band when the
     # request carries one, so this must send no payload.
     assert link.writes == [bytes([CommandId.COMFORT])]
@@ -487,6 +503,7 @@ async def test_comfort_reads_the_band_the_firmware_ships_with() -> None:
 async def test_writing_the_comfort_band_sends_eight_little_endian_values() -> None:
     ses, link = await session()
     zone = await ses.comfort()
+    assert zone is not None
     config.apply_comfort(zone, {"temperature_min": "-5.5", "humidity_max": "62.25"})
     written = await ses.write_comfort(zone)
 
@@ -499,6 +516,14 @@ async def test_writing_the_comfort_band_sends_eight_little_endian_values() -> No
     assert request[7:9] == bytes.fromhex("5118")
     assert written.temperature_min == -550
     assert written.humidity_max == 6225
+
+
+async def test_comfort_returns_none_when_the_firmware_does_not_implement_it() -> None:
+    # A build with CMD_ID_COMFORT stripped falls through cmd_parser.c's
+    # catch-all, which answers a bare 0xff error byte, not a short reply.
+    ses, link = await session(unimplemented=frozenset({CommandId.COMFORT}))
+    assert await ses.comfort() is None
+    assert link.writes == [bytes([CommandId.COMFORT])]
 
 
 def test_a_temperature_below_freezing_survives_the_round_trip() -> None:

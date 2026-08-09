@@ -308,7 +308,10 @@ async def cmd_info(args: argparse.Namespace) -> int:
             cfg = await session.read_config()
             report["config"] = config_module.to_dict(cfg)
             report["derived"] = config_module.derived(cfg)
-            report["comfort"] = config_module.comfort_to_dict(await session.comfort())
+            zone = await session.comfort()
+            report["comfort"] = (
+                config_module.comfort_to_dict(zone) if zone is not None else None
+            )
 
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -474,7 +477,10 @@ async def cmd_config(args: argparse.Namespace) -> int:
             cfg = await session.write_config(config_module.apply(cfg, settings))
         if args.set_time:
             stamp = await session.set_time()
-            log.info("clock set; device now reports %d", stamp)
+            if stamp is None:
+                log.info("clock not set: this firmware does not implement it")
+            else:
+                log.info("clock set; device now reports %d", stamp)
         if args.set_bindkey:
             known = Keystore.open(args.keys).get(link.address)
             if known is None:
@@ -501,18 +507,27 @@ async def cmd_config(args: argparse.Namespace) -> int:
 async def cmd_comfort(args: argparse.Namespace) -> int:
     settings = _parse_settings(args.set)
     config_module.validate_comfort(settings)
+    report: dict[str, float] | None
     async with open_link(args) as link:
         session = config_module.Session(link)
         await session.open()
         zone = await session.comfort()
-        if settings:
-            zone = await session.write_comfort(
-                config_module.apply_comfort(zone, settings)
-            )
-        report = config_module.comfort_to_dict(zone)
+        if zone is None:
+            if settings:
+                msg = "device firmware does not implement the comfort band"
+                raise Error(msg)
+            report = None
+        else:
+            if settings:
+                zone = await session.write_comfort(
+                    config_module.apply_comfort(zone, settings)
+                )
+            report = config_module.comfort_to_dict(zone)
 
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
+    elif report is None:
+        print("Comfort band not supported by this firmware")
     else:
         print(
             f"Comfortable between {report['temperature_min']:g} and "

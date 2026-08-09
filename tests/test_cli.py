@@ -464,6 +464,8 @@ def make_config_module(
     *,
     set_time_error: Error | None = None,
     comfort: dict[str, float] | None = None,
+    comfort_supported: bool = True,
+    time_supported: bool = True,
     bindkey: bytes | None = b"\x00" * 16,
 ) -> SimpleNamespace:
     """Stand in for `config`: an in-memory settings dict behind a fake session."""
@@ -501,10 +503,12 @@ def make_config_module(
             self.cfg = dict(updated)
             return dict(self.cfg)
 
-        async def set_time(self) -> int:
+        async def set_time(self) -> int | None:
             self.time_requested = True
             if set_time_error is not None:
                 raise set_time_error
+            if not time_supported:
+                return None
             return 1_700_000_000
 
         async def set_bindkey(self, key: bytes) -> bytes:
@@ -525,7 +529,9 @@ def make_config_module(
         async def get_bindkey(self) -> bytes | None:
             return bindkey
 
-        async def comfort(self) -> dict[str, float]:
+        async def comfort(self) -> dict[str, float] | None:
+            if not comfort_supported:
+                return None
             return dict(self.zone)
 
         async def write_comfort(self, updated: dict[str, float]) -> dict[str, float]:
@@ -764,6 +770,26 @@ def test_info_reports_what_only_the_device_can_tell_us(
     assert payload["firmware_version"] == "5.8"
     assert payload["bindkey_stored"] is True
     assert payload["comfort"] == COMFORT
+
+
+def test_info_reports_comfort_as_unsupported_rather_than_failing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Firmware that has dropped CMD_ID_COMFORT as dead code must not take the
+    # rest of `info` down with it.
+    link = FakeLink(services=frozenset({CUSTOM_SERVICE}))
+    monkeypatch.setattr(cli, "connect", FakeConnect(link))
+    monkeypatch.setattr(
+        cli,
+        "config_module",
+        make_config_module({"advertising_interval": 32}, comfort_supported=False),
+    )
+
+    assert cli.main(["--json", "info"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["comfort"] is None
+    assert payload["bindkey_stored"] is True
 
 
 def test_info_says_when_no_bind_key_is_stored(
@@ -1276,6 +1302,23 @@ def test_config_set_time_updates_the_clock(
     capsys.readouterr()
 
 
+def test_config_set_time_reports_unsupported_firmware_without_erroring(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(cli, "connect", FakeConnect(FakeLink()))
+    fake_config = make_config_module({"advertising_interval": 32}, time_supported=False)
+    monkeypatch.setattr(cli, "config_module", fake_config)
+
+    with caplog.at_level(logging.INFO, logger="mjwsd05ctl"):
+        assert cli.main(["config", "--set-time"]) == 0
+
+    assert fake_config.sessions[0].time_requested is True
+    assert "clock not set: this firmware does not implement it" in caplog.text
+    capsys.readouterr()
+
+
 def test_config_set_bindkey_writes_the_saved_bind_key(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1372,6 +1415,45 @@ def test_a_bad_comfort_limit_is_caught_before_touching_hardware(
     # No adapter is opened, so this can only have failed on the name itself.
     assert cli.main(["comfort", "--set", "tempurature_min=19"]) == 1
     assert "unknown comfort limit" in capsys.readouterr().err
+
+
+def test_comfort_reports_unsupported_firmware_without_erroring(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "connect", FakeConnect(FakeLink()))
+    monkeypatch.setattr(
+        cli, "config_module", make_config_module({}, comfort_supported=False)
+    )
+
+    assert cli.main(["comfort"]) == 0
+
+    assert capsys.readouterr().out == "Comfort band not supported by this firmware\n"
+
+
+def test_comfort_json_reports_null_for_unsupported_firmware(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "connect", FakeConnect(FakeLink()))
+    monkeypatch.setattr(
+        cli, "config_module", make_config_module({}, comfort_supported=False)
+    )
+
+    assert cli.main(["--json", "comfort"]) == 0
+
+    assert json.loads(capsys.readouterr().out) is None
+
+
+def test_comfort_set_fails_clearly_on_unsupported_firmware(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "connect", FakeConnect(FakeLink()))
+    fake_config = make_config_module({}, comfort_supported=False)
+    monkeypatch.setattr(cli, "config_module", fake_config)
+
+    assert cli.main(["comfort", "--set", "temperature_min=19"]) == 1
+
+    assert "does not implement the comfort band" in capsys.readouterr().err
+    assert fake_config.sessions[0].comfort_writes == []
 
 
 # --- reboot ----------------------------------------------------------------

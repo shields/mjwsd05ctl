@@ -123,6 +123,14 @@ COMFORT = Struct(
 COMFORT_SIZE = 8
 COMFORT_SCALE = 100
 
+# cmd_parser.c's catch-all for an opcode it does not recognize replies with
+# this bare error byte and nothing else — the same one-byte signal the
+# protocol already uses for a malformed write on several other commands. A
+# firmware build that has dropped a command's handler (as some custom builds
+# drop CMD_ID_COMFORT and CMD_ID_UTC_TIME as dead code) falls through to it,
+# which is how `Session` tells "not implemented" apart from a truncated reply.
+UNIMPLEMENTED_COMMAND_REPLY = b"\xff"
+
 # `CMD_ID_DEV_MAC` answers with a length byte, the public address, and the two
 # bytes that differ in the random static address. Flash holds an address least
 # significant byte first, the reverse of how it is written down
@@ -343,22 +351,27 @@ class Session:
             public=_format_mac(public), random_static=_format_mac(random_static)
         )
 
-    async def comfort(self) -> Container[Any]:
-        """Read the comfort band."""
-        return _parse_comfort(await self.request(CommandId.COMFORT))
+    async def comfort(self) -> Container[Any] | None:
+        """Read the comfort band, or None if this firmware does not implement it."""
+        response = await self.request(CommandId.COMFORT)
+        if response == UNIMPLEMENTED_COMMAND_REPLY:
+            return None
+        return _parse_comfort(response)
 
     async def write_comfort(self, zone: Container[Any]) -> Container[Any]:
         """Write the comfort band and return what the device reports afterwards.
 
         The firmware saves the band to its EEPROM before answering, so the reply
-        is what it will use from now on.
+        is what it will use from now on. A caller only reaches this with a
+        `zone` to write by first calling `comfort()`, so a firmware that does
+        not implement the command has already been ruled out there.
         """
         return _parse_comfort(
             await self.request(CommandId.COMFORT, COMFORT.build(zone))
         )
 
-    async def set_time(self, when: datetime | None = None) -> int:
-        """Set the clock.
+    async def set_time(self, when: datetime | None = None) -> int | None:
+        """Set the clock, or return None if this firmware does not implement it.
 
         The firmware displays its stored time directly, so it wants local time
         presented as if it were UTC, which is what the reference flasher sends.
@@ -368,6 +381,8 @@ class Session:
         shift = int(offset.total_seconds()) if offset else 0
         stamp = int(moment.timestamp()) + shift
         response = await self.request(CommandId.UTC_TIME, stamp.to_bytes(4, "little"))
+        if response == UNIMPLEMENTED_COMMAND_REPLY:
+            return None
         return int.from_bytes(response[:4], "little")
 
     async def get_bindkey(self) -> bytes | None:
