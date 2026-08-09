@@ -467,6 +467,7 @@ def make_config_module(
     comfort_supported: bool = True,
     time_supported: bool = True,
     bindkey: bytes | None = b"\x00" * 16,
+    device_number: int | None = None,
 ) -> SimpleNamespace:
     """Stand in for `config`: an in-memory settings dict behind a fake session."""
     sessions: list[Any] = []
@@ -485,6 +486,8 @@ def make_config_module(
             self.time_requested = False
             self.bindkey_writes: list[bytes] = []
             self.mi_keys_writes: list[tuple[bytes, bytes]] = []
+            self.current_device_number = device_number
+            self.device_number_writes: list[int | None] = []
             sessions.append(self)
 
         async def open(self) -> None:
@@ -538,6 +541,14 @@ def make_config_module(
             self.comfort_writes.append(dict(updated))
             self.zone = dict(updated)
             return dict(self.zone)
+
+        async def device_number(self) -> int | None:
+            return self.current_device_number
+
+        async def set_device_number(self, value: int | None) -> int | None:
+            self.device_number_writes.append(value)
+            self.current_device_number = value
+            return self.current_device_number
 
         async def reboot(self) -> None:
             self.rebooted = True
@@ -759,7 +770,9 @@ def test_info_reports_what_only_the_device_can_tell_us(
     link.services = frozenset({CUSTOM_SERVICE})
     monkeypatch.setattr(cli, "connect", FakeConnect(link))
     monkeypatch.setattr(
-        cli, "config_module", make_config_module({"advertising_interval": 32})
+        cli,
+        "config_module",
+        make_config_module({"advertising_interval": 32}, device_number=42),
     )
 
     assert cli.main(["--json", "info"]) == 0
@@ -770,6 +783,7 @@ def test_info_reports_what_only_the_device_can_tell_us(
     assert payload["firmware_version"] == "5.8"
     assert payload["bindkey_stored"] is True
     assert payload["comfort"] == COMFORT
+    assert payload["device_number"] == 42
 
 
 def test_info_reports_comfort_as_unsupported_rather_than_failing(
@@ -1356,6 +1370,48 @@ def test_config_set_bindkey_without_saved_keys_is_an_error(
     assert cli.main(["config", "--set-bindkey"]) == 1
 
     assert "no saved Xiaomi keys for this device" in capsys.readouterr().err
+
+
+def test_config_set_devnum_writes_the_fleet_number(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(cli, "connect", FakeConnect(FakeLink()))
+    fake_config = make_config_module({"advertising_interval": 32})
+    monkeypatch.setattr(cli, "config_module", fake_config)
+
+    with caplog.at_level(logging.INFO, logger="mjwsd05ctl"):
+        assert cli.main(["config", "--set-devnum", "42"]) == 0
+
+    assert fake_config.sessions[0].device_number_writes == [42]
+    assert "device number set to 42" in caplog.text
+    capsys.readouterr()
+
+
+def test_config_clear_devnum_unassigns_the_fleet_number(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(cli, "connect", FakeConnect(FakeLink()))
+    fake_config = make_config_module({"advertising_interval": 32}, device_number=42)
+    monkeypatch.setattr(cli, "config_module", fake_config)
+
+    with caplog.at_level(logging.INFO, logger="mjwsd05ctl"):
+        assert cli.main(["config", "--clear-devnum"]) == 0
+
+    assert fake_config.sessions[0].device_number_writes == [None]
+    assert "device number cleared" in caplog.text
+    capsys.readouterr()
+
+
+def test_config_set_and_clear_devnum_together_is_rejected(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # No adapter is opened, so this can only have failed on the flags themselves.
+    assert cli.main(["config", "--set-devnum", "42", "--clear-devnum"]) == 1
+    assert "mutually exclusive" in capsys.readouterr().err
 
 
 # --- comfort ---------------------------------------------------------------

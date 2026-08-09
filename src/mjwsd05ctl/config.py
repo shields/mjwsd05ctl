@@ -140,6 +140,14 @@ MAC_REPLY_SIZE = 8
 MAC_LEN = 6
 RANDOM_MAC_LAST_BYTE = 0xC0
 
+# `CMD_ID_DEVNUM` (`cmd_parser.h`): a little-endian u16, 1..DEVICE_NUMBER_MAX, or
+# DEVICE_NUMBER_NONE for "unassigned". It is the single source of truth for the
+# LCD's ID row, the derived BLE name "BTH_<n>", and the BTHome devnum object
+# (`app.h`) — setting it re-applies all three immediately.
+DEVICE_NUMBER_SIZE = 2
+DEVICE_NUMBER_NONE = 0xFFFF
+DEVICE_NUMBER_MAX = 9999
+
 # Advertising interval is counted in units of 62.5 ms, LCD update in 50 ms, and
 # connection latency in 20 ms.
 ADV_INTERVAL_MS = 62.5
@@ -370,6 +378,25 @@ class Session:
             await self.request(CommandId.COMFORT, COMFORT.build(zone))
         )
 
+    async def device_number(self) -> int | None:
+        """Read the fleet device number, or None if none is assigned."""
+        return _parse_device_number(await self.request(CommandId.DEVNUM))
+
+    async def set_device_number(self, value: int | None) -> int | None:
+        """Set the fleet device number, or clear it if `value` is None.
+
+        The firmware re-applies the LCD row, BLE name, and BTHome advert before
+        answering, so the reply is the truth about what took effect.
+        """
+        if value is not None and not 1 <= value <= DEVICE_NUMBER_MAX:
+            msg = f"device number must be between 1 and {DEVICE_NUMBER_MAX}"
+            raise ConfigError(msg)
+        wire = DEVICE_NUMBER_NONE if value is None else value
+        response = await self.request(
+            CommandId.DEVNUM, wire.to_bytes(DEVICE_NUMBER_SIZE, "little")
+        )
+        return _parse_device_number(response)
+
     async def set_time(self, when: datetime | None = None) -> int | None:
         """Set the clock, or return None if this firmware does not implement it.
 
@@ -439,6 +466,14 @@ def _parse_comfort(response: bytes) -> Container[Any]:
         msg = f"comfort reply is only {len(response)} bytes"
         raise ConfigError(msg)
     return COMFORT.parse(response[:COMFORT_SIZE])
+
+
+def _parse_device_number(response: bytes) -> int | None:
+    if len(response) < DEVICE_NUMBER_SIZE:
+        msg = f"device number reply is only {len(response)} bytes"
+        raise ConfigError(msg)
+    value = int.from_bytes(response[:DEVICE_NUMBER_SIZE], "little")
+    return None if value == DEVICE_NUMBER_NONE else value
 
 
 def _format_mac(stored: bytes) -> str:

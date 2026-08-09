@@ -212,6 +212,7 @@ class FakeLink:
         bindkey_missing: bool = False,
         mac_reply: bytes = bytes([len(MAC_STORED)]) + MAC_STORED,
         unimplemented: frozenset[CommandId] = frozenset(),
+        device_number: int | None = None,
     ) -> None:
         self.queue: asyncio.Queue[bytes] = asyncio.Queue()
         self.writes: list[bytes] = []
@@ -229,6 +230,9 @@ class FakeLink:
         # fall through cmd_parser.c's catch-all, which answers a bare 0xff
         # error byte instead of the command's usual reply.
         self.unimplemented = unimplemented
+        # The fleet device number the firmware currently holds, echoed back on
+        # every read and after every write, as cmd_parser.c's CMD_ID_DEVNUM does.
+        self.device_number = device_number
 
     def has_characteristic(self, uuid: str) -> bool:
         del uuid
@@ -295,6 +299,20 @@ class FakeLink:
         elif command == CommandId.DEV_MAC:
             reply = self.mac_reply
             self.queue.put_nowait(bytes([CommandId.DEV_MAC]) + reply)
+        elif command == CommandId.DEVNUM:
+            if len(request) > 1:
+                written = int.from_bytes(request[1:3], "little")
+                self.device_number = (
+                    None if written == config.DEVICE_NUMBER_NONE else written
+                )
+            wire = (
+                config.DEVICE_NUMBER_NONE
+                if self.device_number is None
+                else self.device_number
+            )
+            self.queue.put_nowait(
+                bytes([CommandId.DEVNUM]) + wire.to_bytes(2, "little")
+            )
 
 
 async def session(**kwargs: Any) -> tuple[config.Session, FakeLink]:
@@ -397,6 +415,44 @@ async def test_set_time_returns_none_when_the_firmware_does_not_implement_it() -
     ses, link = await session(unimplemented=frozenset({CommandId.UTC_TIME}))
     assert await ses.set_time() is None
     assert link.writes[-1][0] == CommandId.UTC_TIME
+
+
+async def test_device_number_reads_none_when_unassigned() -> None:
+    ses, link = await session()
+    assert await ses.device_number() is None
+    assert link.writes == [bytes([CommandId.DEVNUM])]
+
+
+async def test_device_number_reads_the_assigned_value() -> None:
+    ses, _ = await session(device_number=42)
+    assert await ses.device_number() == 42
+
+
+async def test_set_device_number_sends_a_little_endian_u16() -> None:
+    ses, link = await session()
+    reported = await ses.set_device_number(42)
+    assert link.writes[-1] == bytes([CommandId.DEVNUM, 42, 0])
+    assert reported == 42
+
+
+async def test_set_device_number_none_clears_it() -> None:
+    ses, link = await session(device_number=42)
+    reported = await ses.set_device_number(None)
+    # DEVICE_NUMBER_NONE (0xffff) sent literally, not the firmware's 0 alias.
+    assert link.writes[-1] == bytes([CommandId.DEVNUM, 0xFF, 0xFF])
+    assert reported is None
+
+
+@pytest.mark.parametrize("value", [0, -1, 10_000])
+async def test_a_device_number_outside_the_valid_range_is_rejected(value: int) -> None:
+    ses, _ = await session()
+    with pytest.raises(ConfigError, match="between 1 and 9999"):
+        await ses.set_device_number(value)
+
+
+def test_a_short_device_number_reply_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="only 1 bytes"):
+        config._parse_device_number(b"\x00")
 
 
 async def test_bind_key_round_trips() -> None:

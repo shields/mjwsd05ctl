@@ -107,6 +107,7 @@ class CommandId(IntEnum):
     CFG = 0x55
     CFG_DEF = 0x56
     LCD_DUMP = 0x60
+    DEVNUM = 0x62
     PINCODE = 0x70
     MTU = 0x71
     REBOOT = 0x72

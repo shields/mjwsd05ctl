@@ -162,6 +162,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="write the saved Xiaomi bind key, enabling encrypted advertising",
     )
     config_parser.add_argument(
+        "--set-devnum",
+        type=int,
+        metavar="N",
+        help="set the fleet device number shown on the LCD and in the BLE name "
+        "(1-9999)",
+    )
+    config_parser.add_argument(
+        "--clear-devnum", action="store_true", help="unassign the fleet device number"
+    )
+    config_parser.add_argument(
         "--fields", action="store_true", help="list the settings and exit"
     )
     config_parser.set_defaults(handler=cmd_config)
@@ -312,6 +322,7 @@ async def cmd_info(args: argparse.Namespace) -> int:
             report["comfort"] = (
                 config_module.comfort_to_dict(zone) if zone is not None else None
             )
+            report["device_number"] = await session.device_number()
 
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -466,6 +477,9 @@ async def cmd_config(args: argparse.Namespace) -> int:
 
     settings = _parse_settings(args.set)
     config_module.validate(settings)
+    if args.set_devnum is not None and args.clear_devnum:
+        msg = "--set-devnum and --clear-devnum are mutually exclusive"
+        raise Error(msg)
     async with open_link(args) as link:
         session = config_module.Session(link)
         await session.open()
@@ -488,6 +502,12 @@ async def cmd_config(args: argparse.Namespace) -> int:
                 raise Error(msg)
             await session.set_bindkey(known.bindkey)
             log.info("bind key written")
+        if args.set_devnum is not None:
+            number = await session.set_device_number(args.set_devnum)
+            log.info("device number set to %s", number)
+        if args.clear_devnum:
+            await session.set_device_number(None)
+            log.info("device number cleared")
 
         report = config_module.to_dict(cfg)
         extra = config_module.derived(cfg)
