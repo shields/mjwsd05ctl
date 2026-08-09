@@ -220,6 +220,13 @@ _BTHOME_OBJECTS: dict[int, tuple[str, int, bool, float]] = {
     0x5E: ("direction", 2, False, 0.01),
     0x5F: ("precipitation", 2, False, 1),
     0x60: ("channel", 1, True, 1),
+    # Not an official BTHome object ID (bthome.io has no private-use range):
+    # this fork invents 0xE0 for the fleet device number, deliberately placed
+    # above every assigned ID so a receiver that does not know it decodes
+    # everything before it and merely stops here (`bthome_beacon.h`). Omitted
+    # from the advertisement entirely when no number is assigned, so there is
+    # no sentinel value to special-case here.
+    0xE0: ("device_number", 2, False, 1),
 }
 
 # Variable-length objects, which carry their own size byte.
@@ -252,7 +259,17 @@ def decode_bthome(payload: bytes) -> dict[str, Value]:
 
         entry = _BTHOME_OBJECTS.get(object_id)
         if entry is None:
-            log.debug("unknown BTHome object %#04x; stopping", object_id)
+            # An object's width is only known from `_BTHOME_OBJECTS`, so an
+            # unrecognized id also means the boundary of whatever follows it
+            # is unknown — there is no safe way to keep parsing past this
+            # point, unlike `_decode_mi_objects`' length-prefixed objects.
+            # Report what is left as hex rather than silently drop it. Named
+            # unlike `_decode_mi_objects`' object_<id>: that key is one bounded
+            # object's own bytes, this one is however much of the payload
+            # follows, undifferentiated, possibly spanning objects we would
+            # otherwise have recognized.
+            log.debug("unknown BTHome object %#04x; reporting it raw", object_id)
+            values[f"remainder_from_0x{object_id:02x}"] = payload[offset:].hex()
             break
         name, size, signed, factor = entry
         chunk = payload[offset : offset + size]

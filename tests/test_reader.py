@@ -125,10 +125,21 @@ def test_bthome_repeated_objects_are_numbered_not_overwritten() -> None:
     assert values["temperature_2"] == 2.0
 
 
-def test_bthome_stops_at_an_object_it_does_not_know() -> None:
+def test_bthome_decodes_the_fleet_device_number_object() -> None:
+    # 0xE0 is this fork's own, non-standard object id (bthome_beacon.h),
+    # placed above every assigned id so it decodes last, not stops parsing.
+    # 9999, the documented max (cmd_parser.h), needs both bytes: a value that
+    # fits in one byte would still pass even if the table's width were wrong.
+    payload = bytes([0x01, 50]) + bytes([0xE0]) + struct.pack("<H", 9999)
+    values = reader.decode_bthome(payload)
+    assert values["battery"] == 50
+    assert values["device_number"] == 9999
+
+
+def test_bthome_reports_the_raw_value_of_an_object_it_does_not_know() -> None:
     payload = bytes([0x01, 50, 0x7F, 1, 2, 3])
     values = reader.decode_bthome(payload)
-    assert values == {"battery": 50}
+    assert values == {"battery": 50, "remainder_from_0x7f": "010203"}
 
 
 def test_bthome_variable_length_objects() -> None:
