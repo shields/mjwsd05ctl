@@ -96,6 +96,22 @@ in the same order and hangs the same way, so a stall there is not evidence of a
 transcription error, and resends and longer settling times do not help. This is
 why `register` alone passes a hint to `_pump`.
 
+The opening answer is not a binding indicator, however much the reference
+flasher's `is_activated` reads like one. A device straight from the factory,
+never bound and with no Mi Home account anywhere in the picture, answers
+`000000000200` — the branch that looks like "already activated" — and follows it
+with a device id it already holds, `\0blt.3.129v…g00`, in two chunks behind a
+four-byte header. It then dies at `000000030400` exactly as a `000000000100`
+device does. So neither opening tells you whether anything needs clearing, and
+reading `000000000200` as a leftover Mi Home registration sends you looking for
+an account to delete that may not exist. Only the buttons decide.
+
+Stalling is not the only shape the refusal takes: the same device has been seen
+to drop the link at `000000030400` rather than ignore it. Which of the two you
+get is not yours to choose, so `_pump` hangs the hint on a `TransportError` as
+well as on a timeout; a refusal that came back as a bare "device disconnected"
+told the reader nothing they could act on.
+
 ## Hardware-free testing
 
 `tests/test_miauth.py` drives the registration and login state machines against
@@ -150,11 +166,40 @@ would not answer or advertise until reset; do not undo their fixes:
   resends unanswered commands, which is safe because every opcode it carries
   is idempotent, and it first discards stale queued replies, because a resend
   can double-answer and replies carry no request correlation — keep all of
-  these properties when adding commands.
+  these properties when adding commands. `RESEND_INTERVAL` bounds the write as
+  well as the wait for a reply: a write that hangs is the case resending is
+  for, and one issued outside that scope holds up the resend it should be
+  causing.
 - The flashed firmware advertises every five seconds by default and accepts
   connections most reliably right after boot or a top-button press (the pvvx
   "connect" function), which is why `bootstrap` retries its post-reboot
   reconnect instead of scanning once.
+- Bleak's `disconnected_callback` does not always arrive. Two runs of the same
+  command dropped at the same point in the same exchange; one raised out of
+  `Link.take` at once, the other waited out the caller's whole 60 s deadline
+  with the disconnect already logged by Bleak's own backend. Reading the chain
+  from `centralManager_didDisconnectPeripheral_error_` to the callback turns up
+  nothing conditional, so do not assume the event will be set. `Link` asks the
+  platform rather than waiting to be told, in the two places a wait can begin:
+  `_check_connected` reads `is_connected` on the way into every method, and
+  `take` polls it every `DISCONNECT_POLL` while blocked. Both record what they
+  find by setting the event, so one discovery serves the rest of the link. Do
+  not reduce either to whichever half looks redundant — the event alone is what
+  goes missing, and a flag that was never set reads exactly like a healthy
+  link. For the same reason, wait for notifications through `take` rather than
+  on a queue directly: `request_ext_ota` did the latter, and so would have
+  spent its whole two-minute erase deadline on a dead link, after discarding
+  the Mi Home keys and the measurement history.
+- A write has the same exposure and nothing underneath it: CoreBluetooth's
+  write-with-response awaits its delegate future bare, where the read path
+  carries its own deadline, so `Link.write` imposes `WRITE_TIMEOUT`. Without it
+  an unanswered write is charged to whichever exchange it belonged to, and
+  `MiAuth._pump` would report a device that never answered rather than a write
+  that was never acknowledged. It is the backstop for callers with no cadence
+  of their own, `ota`'s update stream above all; `Session.request` bounds its
+  own writes more tightly, and should. Write-without-response cannot hang this
+  way — CoreBluetooth does not await anything for it — which is why the update
+  stream is unaffected in practice.
 
 ## Lint
 

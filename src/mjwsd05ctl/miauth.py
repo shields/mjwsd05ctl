@@ -59,7 +59,7 @@ from .constants import (
     MI_TOKEN_LEN,
     MiStatus,
 )
-from .errors import ActivationError
+from .errors import ActivationError, TransportError
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -72,13 +72,15 @@ REGISTER_TIMEOUT = 60.0
 LOGIN_TIMEOUT = 60.0
 
 # A thermometer with buttons will not register until its previous binding has
-# been cleared and it has been put back into binding mode, and it refuses by
-# falling silent part way through the exchange rather than by reporting a
-# status: it answers the opening command, asks for the exchange to restart,
-# and then ignores the key-exchange announcement for as long as one waits
-# (pvvx/ATC_MiThermometer#505). Nothing the host sends recovers it, so the only
-# useful thing to say about a registration that times out is which buttons to
-# press. Login has no such precondition and gets no hint.
+# been cleared and it has been put back into binding mode, and it refuses
+# without ever reporting a status: it answers the opening command, asks for the
+# exchange to restart, and then abandons the key-exchange announcement
+# (pvvx/ATC_MiThermometer#505). Sometimes it ignores that announcement for as
+# long as one waits; sometimes it drops the link there instead. Both are the
+# same refusal, so a dead link during registration earns this hint just as a
+# timeout does. Nothing the host sends recovers either, so the only useful
+# thing to say is which buttons to press. Login has no such precondition and
+# gets no hint.
 BINDING_MODE_HINT = (
     "hold both buttons until the screen blinks and the device resets, then "
     "briefly press the top button and then the bottom one; registration only "
@@ -86,6 +88,7 @@ BINDING_MODE_HINT = (
 )
 
 type _Handler = Callable[[bytes], Awaitable[None]]
+type _Opening = Callable[[], Awaitable[None]]
 
 # The device pauses between accepting a command and being ready for the next.
 SETTLE = 0.25
@@ -254,6 +257,7 @@ class MiAuth:
         self._our_proof = b""
         self._received_proof = bytearray()
         self._hint: str | None = None
+        self._handler: _Handler | None = None
 
     async def open(self) -> None:
         """Subscribe to both authentication characteristics."""
@@ -277,8 +281,12 @@ class MiAuth:
         self._new_keypair()
 
         log.info("registering; this replaces any existing Mi Home pairing")
-        await self._control(MI_CMD_REGISTER_START)
-        await self._pump(self._handle_register, timeout=timeout, hint=BINDING_MODE_HINT)
+        await self._pump(
+            self._handle_register,
+            timeout=timeout,
+            hint=BINDING_MODE_HINT,
+            opening=lambda: self._control(MI_CMD_REGISTER_START),
+        )
         return MiKeys(
             token=self._token, bindkey=self._bindkey, device_id=self._device_id
         )
@@ -300,24 +308,47 @@ class MiAuth:
         await self._data(_ANNOUNCE_LOGIN)
 
     async def _pump(
-        self, handler: _Handler, *, timeout: float, hint: str | None = None
+        self,
+        handler: _Handler,
+        *,
+        timeout: float,
+        hint: str | None = None,
+        opening: _Opening | None = None,
     ) -> None:
         """Dispatch notifications until the device reports success or failure.
 
-        `hint` is appended to the timeout message when falling silent is a
-        known way for the device to refuse rather than a sign of a dead link.
-        It stops applying the moment `_handle_common` restarts the exchange as
-        a login, even if that happened inside a call that started as a
-        registration: from there on, a stall is a login problem, and blaming
-        binding mode would misdirect whoever reads the error.
+        `hint` is appended to the failure message when refusing is a known way
+        for the device to end the exchange, rather than a sign of a fault
+        elsewhere. It covers a dropped link as well as a stall, because the
+        refusal takes both shapes. It stops applying the moment
+        `_handle_common` restarts the exchange as a login, even if that
+        happened inside a call that started as a registration: from there on,
+        a failure is a login problem, and blaming binding mode would misdirect
+        whoever reads the error.
+
+        `opening`, when given, is awaited inside the same timeout and the same
+        hinted exception handling as the notification loop below it: a device
+        that refuses registration by dropping the link can drop it on the very
+        first write, before there is anything to dispatch, and that failure
+        needs the same hint as one noticed later.
+
+        `handler` is kept as `self._handler`, not only the local parameter, so
+        `_handle_common` can retarget it to `_handle_login` when it restarts
+        the exchange as a login: notifications from that point on belong to
+        the login sub-exchange, and dispatching them to whatever handler this
+        call started with — silently ignored by its `else` branch — leaves the
+        sub-exchange unable to ever finish.
         """
         if self._events is None:
             msg = "MiAuth.open() must be called before registering or logging in"
             raise ActivationError(msg)
 
         self._hint = hint
+        self._handler = handler
         try:
             async with asyncio.timeout(timeout):
+                if opening is not None:
+                    await opening()
                 while True:
                     source, value = await self._link.take(self._events)
                     if source == MI_AUTH_CONTROL_CHAR:
@@ -326,12 +357,22 @@ class MiAuth:
                         continue
                     if await self._handle_common(value):
                         continue
-                    await handler(value)
+                    await self._handler(value)
         except TimeoutError:
             msg = f"device did not respond within {timeout:g}s"
-            if self._hint is not None:
-                msg = f"{msg}; {self._hint}"
-            raise ActivationError(msg) from None
+            raise ActivationError(self._hinted(msg)) from None
+        except TransportError as exc:
+            # `_hinted` already returns the message unchanged when there is no
+            # hint, so this can update the caught exception in place rather
+            # than fabricate a new one just to change its text.
+            exc.args = (self._hinted(str(exc)),)
+            raise
+
+    def _hinted(self, message: str) -> str:
+        """Append this exchange's hint to a failure message, if it has one."""
+        if self._hint is None:
+            return message
+        return f"{message}; {self._hint}"
 
     def _handle_status(self, value: bytes) -> bool:
         """Interpret a control characteristic notification. True means done."""
@@ -356,11 +397,23 @@ class MiAuth:
         """Handle the device asking us to restart, in either mode."""
         if not value.startswith(_RELOGIN_PREFIX) or len(value) < _RELOGIN_MIN_LEN:
             return False
-        await self._data(_RELOGIN_REPLY + value[3:])
-        if value[3] == _RELOGIN_REASON_LOGIN:
-            await asyncio.sleep(SETTLE)
+        restarting_as_login = value[3] == _RELOGIN_REASON_LOGIN
+        if restarting_as_login:
+            # Clear the hint before the ack below can fail: the device has
+            # already asked to restart as a login, so a dropped link here is
+            # a login problem even when it is the ack itself that drops,
+            # not only once _begin_login has run.
             self._hint = None
+        await self._data(_RELOGIN_REPLY + value[3:])
+        if restarting_as_login:
+            await asyncio.sleep(SETTLE)
             await self._begin_login()
+            # Notifications from here on drive the login sub-exchange, even
+            # when this pivot happened inside a call that started as
+            # registration: _pump's own loop keeps calling whatever handler
+            # it started with otherwise, and _handle_register silently drops
+            # every message the login protocol sends.
+            self._handler = self._handle_login
         return True
 
     async def _handle_register(self, value: bytes) -> None:

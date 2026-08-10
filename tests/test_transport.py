@@ -371,12 +371,14 @@ class FakeGATTClient:
     ) -> None:
         self.address = address
         self.kwargs: dict[str, Any] = {}
+        self.is_connected = True
         self.services = FakeServices(service_uuids, characteristic_uuids)
         self._notify_handlers: dict[str, NotifyHandler] = {}
         self._reads: dict[str, bytes] = {}
         self._read_errors: dict[str, Exception] = {}
         self.writes: list[tuple[str, bytes, bool | None]] = []
         self.write_error: Exception | None = None
+        self.write_never_answered = False
         self.connect_error: Exception | None = None
         self.disconnect_error: Exception | None = None
         self.connect_calls = 0
@@ -401,6 +403,9 @@ class FakeGATTClient:
         if self.write_error is not None:
             raise self.write_error
         self.writes.append((uuid, bytes(data), response))
+        if self.write_never_answered:
+            # The value went out; the acknowledgement never came back.
+            await asyncio.Event().wait()
 
     def set_read(self, uuid: str, value: bytes) -> None:
         self._reads[uuid] = value
@@ -471,6 +476,87 @@ async def test_take_cancelled_while_the_queue_is_empty_requeues_nothing() -> Non
         with pytest.raises(asyncio.CancelledError):
             await task
     assert queue.empty()
+
+
+async def test_every_entry_point_asks_the_platform_not_just_the_flag() -> None:
+    # `take` and `write` were guarded one at a time; everything else still
+    # trusted an event that Bleak may never set. A device CoreBluetooth has
+    # silently dropped then reads as healthy right up until some BleakError
+    # happens to surface from the discarded service cache — or, for a read,
+    # until Bleak's own 20s deadline expires. `_check_connected` asks instead.
+    client = FakeGATTClient(characteristic_uuids=[CUSTOM_CHAR])
+    link = transport.Link(client)  # ty: ignore[invalid-argument-type]
+    assert link.has_characteristic(CUSTOM_CHAR)  # healthy: the flag is right
+
+    client.is_connected = False  # dropped, with no callback to say so
+    for attempt in (
+        lambda: link.has_service(CUSTOM_SERVICE),
+        lambda: link.has_characteristic(CUSTOM_CHAR),
+    ):
+        with pytest.raises(TransportError, match="device disconnected"):
+            attempt()
+    with pytest.raises(TransportError, match="device disconnected"):
+        await link.read(CUSTOM_CHAR)
+    with pytest.raises(TransportError, match="device disconnected"):
+        await link.write(CUSTOM_CHAR, b"\x00")
+    with pytest.raises(TransportError, match="device disconnected"):
+        await link.subscribe(CUSTOM_CHAR)
+
+
+async def test_asking_the_platform_records_the_answer() -> None:
+    # Having found out, `_check_connected` sets the event, so a `take` already
+    # waiting elsewhere on this link ends now rather than on its next poll.
+    client = FakeGATTClient()
+    link = transport.Link(client)  # ty: ignore[invalid-argument-type]
+    client.is_connected = False
+    with pytest.raises(TransportError, match="device disconnected"):
+        link.has_service(CUSTOM_SERVICE)
+
+    queue: asyncio.Queue[bytes] = asyncio.Queue()
+    async with asyncio.timeout(1):
+        with pytest.raises(TransportError, match="device disconnected"):
+            await link.take(queue)
+
+
+async def test_take_notices_a_drop_bleak_never_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CoreBluetooth has been seen to log a disconnect and never invoke the
+    # callback that sets the event, leaving `take` to wait out the caller's
+    # whole protocol deadline — 60s of it, on the registration that prompted
+    # this. Polling the platform's own view is what stops that.
+    monkeypatch.setattr(transport, "DISCONNECT_POLL", 0.01)
+    client = FakeGATTClient()
+    link = transport.Link(client)  # ty: ignore[invalid-argument-type]
+    queue: asyncio.Queue[bytes] = asyncio.Queue()
+    client.is_connected = False
+    async with asyncio.timeout(1):
+        with pytest.raises(TransportError, match="device disconnected"):
+            await link.take(queue)
+
+    # Having found out the hard way, `take` records it, so the next command on
+    # this link fails at once instead of polling for the same second again.
+    with pytest.raises(TransportError, match="device disconnected"):
+        await link.write("0000ff01-0000-1000-8000-00805f9b34fb", b"\x01")
+
+
+async def test_take_keeps_waiting_while_the_link_is_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The poll must only end the wait when the platform says the link is gone;
+    # firing on the interval alone would turn every quiet moment between
+    # notifications into a spurious "device disconnected".
+    monkeypatch.setattr(transport, "DISCONNECT_POLL", 0.01)
+    link = transport.Link(FakeGATTClient())  # ty: ignore[invalid-argument-type]
+    queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+    async def answer_late() -> None:
+        await asyncio.sleep(0.05)  # several polls' worth of silence
+        queue.put_nowait(b"\x09")
+
+    async with asyncio.timeout(1):
+        _, value = await asyncio.gather(answer_late(), link.take(queue))
+    assert value == b"\x09"
 
 
 async def test_take_prefers_data_over_a_simultaneous_disconnect() -> None:
@@ -679,6 +765,24 @@ async def test_write_translates_a_bleak_error_into_a_transport_error() -> None:
         await link.write(CUSTOM_CHAR, b"\x00")
 
 
+async def test_write_gives_up_on_an_acknowledgement_that_never_comes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CoreBluetooth's write-with-response awaits its delegate callback with no
+    # deadline of its own, so a callback that goes missing — the way the
+    # disconnect callback has been seen to — hangs the write against whatever
+    # the caller happened to allow, or forever. The bound belongs here, where
+    # the message can say a write went unanswered rather than let some outer
+    # deadline blame the exchange it was part of.
+    monkeypatch.setattr(transport, "WRITE_TIMEOUT", 0.01)
+    client = FakeGATTClient()
+    client.write_never_answered = True
+    link = transport.Link(client)  # ty: ignore[invalid-argument-type]
+    async with asyncio.timeout(1):
+        with pytest.raises(TransportError, match="was not acknowledged within"):
+            await link.write(CUSTOM_CHAR, b"\x00")
+
+
 async def test_write_reports_a_dropped_link_as_a_disconnect() -> None:
     # Stock firmware hangs up the moment an unauthenticated OTA starts. Bleak
     # discards its service cache on disconnect, so resolving the write type is
@@ -791,18 +895,6 @@ async def test_device_info_reads_all_three_dis_characteristics() -> None:
     assert await link.device_info() == DeviceInfo(
         firmware_revision="0005", hardware_revision="v1", software_revision="1.2.3"
     )
-
-
-async def test_expect_returns_the_next_queued_notification() -> None:
-    queue: asyncio.Queue[bytes] = asyncio.Queue()
-    queue.put_nowait(b"\x01")
-    assert await transport.expect(queue) == b"\x01"
-
-
-async def test_expect_times_out_rather_than_hanging_forever() -> None:
-    queue: asyncio.Queue[bytes] = asyncio.Queue()
-    with pytest.raises(TransportError, match=r"timed out after 0\.01s"):
-        await transport.expect(queue, timeout=0.01)
 
 
 def bleak_client_factory(

@@ -16,8 +16,9 @@ import asyncio
 import struct
 
 import pytest
+from conftest import FakeGATTClient
 
-from mjwsd05ctl import ota
+from mjwsd05ctl import ota, transport
 from mjwsd05ctl.constants import (
     CUSTOM_CHAR,
     HW_ID_CH,
@@ -30,7 +31,7 @@ from mjwsd05ctl.constants import (
     OTA_START_COMMANDS,
     CommandId,
 )
-from mjwsd05ctl.errors import OTAError
+from mjwsd05ctl.errors import OTAError, TransportError
 from mjwsd05ctl.firmware import FirmwareImage
 from mjwsd05ctl.ota import crc16_modbus, describe, end_frame, frame
 
@@ -79,8 +80,13 @@ class FakeLink:
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
         self.writes: list[bytes] = []
         self.subscribed: list[str] = []
+        self._disconnected = asyncio.Event()
+        self._client = FakeGATTClient(self._disconnected)
         for reply in replies or []:
             self._queue.put_nowait(reply)
+
+    def disconnect(self) -> None:
+        self._disconnected.set()
 
     def has_characteristic(self, uuid: str) -> bool:
         del uuid
@@ -93,6 +99,11 @@ class FakeLink:
     async def ensure_subscribed(self, uuid: str) -> asyncio.Queue[bytes]:
         self.subscribed.append(uuid)
         return self._queue
+
+    async def take(self, queue: asyncio.Queue[bytes]) -> bytes:
+        # Borrow the real implementation, so the erase wait is tested against
+        # the disconnect semantics it actually relies on.
+        return await transport.Link.take(self, queue)  # ty: ignore[invalid-argument-type]
 
     async def write(
         self, uuid: str, data: bytes, *, response: bool | None = None
@@ -169,6 +180,20 @@ async def test_extended_update_times_out_as_a_domain_error() -> None:
         await ota.request_ext_ota(link, 8192, timeout=0.05)  # ty: ignore[invalid-argument-type]
 
 
+async def test_extended_update_gives_up_when_the_device_goes_away() -> None:
+    # The erase deadline is two minutes, and this path has already discarded
+    # the stored Mi Home keys and the measurement history by the time it is
+    # waiting. Reading the queue directly would spend all two minutes on a dead
+    # link and then blame the erase; going through `take` says what happened,
+    # and says it at once. The outer bound turns a regression into a fast
+    # failure rather than a two-minute hang.
+    link = FakeLink()
+    link.disconnect()
+    async with asyncio.timeout(1):
+        with pytest.raises(TransportError, match="device disconnected"):
+            await ota.request_ext_ota(link, 8192)  # ty: ignore[invalid-argument-type]
+
+
 class FakeOTADevice:
     """Records the update stream and answers the periodic status reads."""
 
@@ -187,6 +212,8 @@ class FakeOTADevice:
         self.reads = 0
         self.subscribed: list[str] = []
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._disconnected = asyncio.Event()
+        self._client = FakeGATTClient(self._disconnected)
         # Whatever asks for the extended area gets an immediate all-clear.
         self._queue.put_nowait(bytes([CommandId.SET_OTA, 3]))
 
@@ -200,6 +227,9 @@ class FakeOTADevice:
     async def ensure_subscribed(self, uuid: str) -> asyncio.Queue[bytes]:
         self.subscribed.append(uuid)
         return self._queue
+
+    async def take(self, queue: asyncio.Queue[bytes]) -> bytes:
+        return await transport.Link.take(self, queue)  # ty: ignore[invalid-argument-type]
 
     async def write(
         self, uuid: str, data: bytes, *, response: bool | None = None

@@ -222,11 +222,14 @@ async def request_ext_ota(
 
     # The device acknowledges with ERASING, then sends one PROGRESS notification
     # per sector cleared, then READY. Erasing 200 KiB of flash takes a while, so
-    # this deadline covers the whole sequence.
+    # this deadline covers the whole sequence. It is also two minutes to sit on
+    # a link that may already be dead, on the one path that has thrown away the
+    # stored Mi Home keys and the measurement history before reaching here, so
+    # the wait goes through `link.take` and gives up the moment the device does.
     try:
         async with asyncio.timeout(timeout):
             while True:
-                response = await queue.get()
+                response = await link.take(queue)
                 if (
                     len(response) < _EXT_OTA_MIN_RESPONSE
                     or response[0] != CommandId.SET_OTA

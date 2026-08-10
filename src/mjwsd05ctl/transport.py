@@ -48,7 +48,33 @@ log = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_SCAN_TIMEOUT = 20.0
 CONNECT_ATTEMPTS = 3
-NOTIFY_TIMEOUT = 20.0
+
+# Bleak's disconnect callback is the fast way out of `take`, but it cannot be
+# the only one: on CoreBluetooth it has been seen not to arrive at all. Two
+# runs of the same command against the same device dropped at the same point,
+# and one raised out of `take` immediately while the other sat out a full
+# sixty-second protocol deadline — after Bleak had already logged the
+# disconnect. `is_connected` asks the platform instead of waiting to be told
+# (`peripheral.state()` on CoreBluetooth, the cached property on BlueZ), so
+# polling it bounds a missed callback at this interval rather than at whatever
+# deadline the caller happened to set.
+DISCONNECT_POLL = 1.0
+
+# The same missed-callback risk on the write path, where there is no deadline
+# underneath at all: CoreBluetooth's write-with-response awaits its delegate
+# future bare (`PeripheralDelegate.write_characteristic`), unlike the read,
+# which carries its own. A write is answered in milliseconds or not at all, so
+# this only has to be short enough to beat the callers' protocol deadlines and
+# report what actually went wrong. Without it an unanswered write is charged to
+# whichever exchange it was part of, or hangs outright where nothing bounds it.
+#
+# "Beat" has to mean beat with room to spare: `config.Session.request` wraps
+# its whole retry loop, write included, in a timeout of its own
+# (`RESPONSE_TIMEOUT`, 10s) that starts a moment before this one does. Tying
+# the two at 10s each does not favor this timeout — the earlier-armed outer
+# one fires first, so the caller sees its own generic "did not answer" instead
+# of the specific message below. Keep this comfortably under `RESPONSE_TIMEOUT`.
+WRITE_TIMEOUT = 5.0
 
 # Devices advertise under several names depending on firmware: the stock name,
 # the pvvx default, and whatever the user has since set. `ble_set_name()` builds
@@ -105,17 +131,26 @@ class Link:
         return self._client.address
 
     def _check_connected(self) -> None:
-        """Raise TransportError if the link is already known to have dropped.
+        """Raise TransportError if the link has dropped, asking rather than trusting.
 
         Every method below that touches `self._client.services` needs this:
         Bleak discards its service cache on disconnect, so those accesses are
         the first thing to fail once the device has gone, with a bare
         BleakError ("Service Discovery has not been performed yet") that reads
-        like a bug here rather than what it is. Checking the flag we already
-        track catches the common case before Bleak's own message has a chance
-        to confuse anyone; each caller's `except BleakError` still covers the
-        narrower race where the drop is discovered only by the access itself.
+        like a bug here rather than what it is. Catching the drop first means
+        Bleak's own message never gets the chance to confuse anyone; each
+        caller's `except BleakError` still covers the narrower race where the
+        drop is discovered only by the access itself.
+
+        The flag alone is not enough to go on, for the reason `DISCONNECT_POLL`
+        exists: Bleak's disconnect callback has been seen never to arrive, and
+        a flag that was never set reads exactly like a healthy link. Asking the
+        platform costs a property read — `peripheral.state()` on CoreBluetooth,
+        a cached attribute on BlueZ — so every entry point can afford to ask,
+        and the answer is recorded for whoever asks next.
         """
+        if not self._client.is_connected:
+            self._disconnected.set()
         if self._disconnected.is_set():
             msg = "device disconnected"
             raise TransportError(msg)
@@ -196,14 +231,28 @@ class Link:
 
         Nothing posts to a queue after a disconnect, so waiting on one blind
         would sit out the caller's whole protocol timeout for an answer that
-        can no longer come.
+        can no longer come. The disconnect is noticed either way: by Bleak's
+        callback when it comes, and by polling the platform when it does not.
         """
         get = asyncio.ensure_future(queue.get())
         dropped = asyncio.ensure_future(self._disconnected.wait())
         try:
-            done, _ = await asyncio.wait(
-                (get, dropped), return_when=asyncio.FIRST_COMPLETED
-            )
+            while True:
+                done, _ = await asyncio.wait(
+                    (get, dropped),
+                    timeout=DISCONNECT_POLL,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if get in done:
+                    return get.result()
+                if dropped in done:
+                    break
+                if not self._client.is_connected:
+                    # Nobody told us, so tell everyone else, and stop waiting:
+                    # `_check_connected` can now fail the next write without a
+                    # poll of its own.
+                    self._disconnected.set()
+                    break
         except asyncio.CancelledError:
             # The caller's cancellation can land just as the get finishes, and
             # its item is already off the queue; put it back or it is lost.
@@ -213,8 +262,6 @@ class Link:
         finally:
             get.cancel()
             dropped.cancel()
-        if get in done:
-            return get.result()
         msg = "device disconnected"
         raise TransportError(msg)
 
@@ -265,7 +312,11 @@ class Link:
                 else:
                     response = "write-without-response" not in char.properties
             log.debug("write %s -> %s", _short(uuid), data.hex())
-            await self._client.write_gatt_char(uuid, data, response=response)
+            async with asyncio.timeout(WRITE_TIMEOUT):
+                await self._client.write_gatt_char(uuid, data, response=response)
+        except TimeoutError:
+            msg = f"write to {uuid} was not acknowledged within {WRITE_TIMEOUT:g}s"
+            raise TransportError(msg) from None
         except BleakError as exc:
             msg = f"write to {uuid} failed: {exc}"
             raise TransportError(msg) from exc
@@ -298,18 +349,6 @@ class Link:
             hardware_revision=await self.read_string(DIS_HARDWARE_REVISION_CHAR),
             software_revision=await self.read_string(DIS_SOFTWARE_REVISION_CHAR),
         )
-
-
-async def expect(
-    queue: asyncio.Queue[bytes], *, timeout: float = NOTIFY_TIMEOUT
-) -> bytes:
-    """Await the next notification, or fail rather than hang."""
-    try:
-        async with asyncio.timeout(timeout):
-            return await queue.get()
-    except TimeoutError:
-        msg = f"timed out after {timeout:g}s waiting for a notification"
-        raise TransportError(msg) from None
 
 
 def _short(uuid: str) -> str:

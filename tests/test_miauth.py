@@ -27,6 +27,7 @@ import logging
 from collections.abc import Sequence
 
 import pytest
+from conftest import FakeGATTClient
 from Crypto.Cipher import AES
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -291,6 +292,7 @@ class FakeLink:
         self.queue: asyncio.Queue[tuple[str, bytes]] = asyncio.Queue()
         self.writes: list[tuple[str, bytes]] = []
         self._disconnected = asyncio.Event()
+        self._client = FakeGATTClient(self._disconnected)
         device.outbox = self.queue
 
     def disconnect(self) -> None:
@@ -481,6 +483,193 @@ async def test_a_login_restart_mid_registration_does_not_blame_binding_mode() ->
     with pytest.raises(ActivationError, match="did not respond") as raised:
         await auth.register(timeout=0.05)
     assert "both buttons" not in str(raised.value)
+
+
+async def test_a_restart_for_another_reason_leaves_the_hint_armed() -> None:
+    # The counterpart to the test above, and the reason clearing the hint is
+    # guarded by the reason byte rather than done for every restart request:
+    # only reason 1 pivots to a login. Any other reason is acknowledged and the
+    # registration carries on, so a refusal after one is still the binding-mode
+    # refusal. An unguarded `self._hint = None` would disarm the hint for the
+    # rest of the exchange and pass every other test in this file.
+    class RestartsForAnotherReasonThenGoesQuiet(FakeDevice):
+        def handle_control(self, payload: bytes) -> None:
+            if payload.hex() == "a2000000":
+                # Prefix "000004" plus a reason byte other than 1, so the
+                # exchange stays a registration rather than becoming a login.
+                self.data(bytes.fromhex("00000402"))
+                return
+
+    link = FakeLink(RestartsForAnotherReasonThenGoesQuiet())
+    auth = MiAuth(link)  # ty: ignore[invalid-argument-type]
+    await auth.open()
+    with pytest.raises(ActivationError, match="did not respond") as raised:
+        await auth.register(timeout=0.05)
+    assert "both buttons" in str(raised.value)
+    # And the request was still acknowledged, as `_handle_common` promises.
+    assert (MI_AUTH_DATA_CHAR, bytes.fromhex("00000502")) in link.writes
+
+
+async def test_a_dropped_relogin_ack_does_not_blame_binding_mode_either() -> None:
+    # The same restart-as-login pivot as above, but the link drops on the ack
+    # itself (`_RELOGIN_REPLY + reason`) rather than on the login sub-exchange
+    # that follows it. `_handle_common` must clear the hint before attempting
+    # that write, not after, or this narrow race still blames binding mode for
+    # what the device already told the client is a login problem.
+    class RestartsAsLoginDuringRegistration(FakeDevice):
+        def handle_control(self, payload: bytes) -> None:
+            if payload.hex() == "a2000000":
+                self.data(bytes.fromhex("00000401"))
+                return
+
+    class DropsOnTheReloginAck(FakeLink):
+        async def write(
+            self, uuid: str, data: bytes, *, response: bool | None = None
+        ) -> None:
+            if uuid == MI_AUTH_DATA_CHAR and data == bytes.fromhex("00000501"):
+                msg = "device disconnected"
+                raise TransportError(msg)
+            await super().write(uuid, data, response=response)
+
+    link = DropsOnTheReloginAck(RestartsAsLoginDuringRegistration())
+    auth = MiAuth(link)  # ty: ignore[invalid-argument-type]
+    await auth.open()
+    async with asyncio.timeout(1):
+        with pytest.raises(TransportError, match="device disconnected") as raised:
+            await auth.register(timeout=5.0)
+    assert "both buttons" not in str(raised.value)
+
+
+async def test_a_dead_link_on_the_opening_write_still_names_the_buttons() -> None:
+    # The opening control write happens inside _pump's own `opening` scope
+    # now, but before this it ran ahead of _pump entirely, so a TransportError
+    # raised there -- the link already dead, or (since transport.WRITE_TIMEOUT
+    # was added) a write that simply never got acknowledged -- reached the
+    # caller as a bare "device disconnected" despite being exactly the
+    # refusal this hint exists to explain.
+    class DiesOnFirstWrite(FakeLink):
+        async def write(
+            self, uuid: str, data: bytes, *, response: bool | None = None
+        ) -> None:
+            del uuid, data, response
+            msg = "device disconnected"
+            raise TransportError(msg)
+
+    auth = MiAuth(DiesOnFirstWrite(FakeDevice()))  # ty: ignore[invalid-argument-type]
+    await auth.open()
+    async with asyncio.timeout(1):
+        with pytest.raises(TransportError, match="device disconnected") as raised:
+            await auth.register(timeout=5.0)
+    assert "both buttons" in str(raised.value)
+
+
+async def test_a_login_restart_mid_registration_actually_completes() -> None:
+    # The counterpart to `test_a_login_restart_mid_registration_does_not_
+    # blame_binding_mode`: that test's device goes silent after the pivot, so
+    # it cannot tell a genuinely stalled login apart from one whose messages
+    # are reaching the wrong handler and being silently dropped. This device
+    # plays an ordinary key exchange to completion and only then redirects to
+    # login instead of confirming registration, and plays the login handshake
+    # out for real: `_pump` has to retarget its dispatch to `_handle_login`,
+    # or every message the device sends from here on falls into
+    # `_handle_register`'s `else` branch and the exchange times out no matter
+    # how correctly the device behaves.
+    class RedirectsToLoginAfterKeyExchange(FakeDevice):
+        def handle_control(self, payload: bytes) -> None:
+            if payload.hex() == "13000000":  # client: "I verified you"
+                self.data(bytes.fromhex("00000401"))  # "log in instead"
+                return
+            super().handle_control(payload)
+
+    device = RedirectsToLoginAfterKeyExchange()
+    auth = MiAuth(FakeLink(device))  # ty: ignore[invalid-argument-type]
+    await auth.open()
+    # The outer guard is well clear of register()'s own deadline so that, if
+    # the retargeting regresses, the failure is register()'s own
+    # ActivationError rather than a race with this test's safety net.
+    async with asyncio.timeout(5):
+        keys = await auth.register(timeout=0.5)
+    assert device.logged_in
+    assert keys.token
+    assert keys.bindkey
+
+
+async def test_a_dropped_link_during_registration_names_the_buttons() -> None:
+    # The refusal's other shape, replayed from a factory-fresh thermometer: it
+    # answers with the "activated" opening, hands back the device id it already
+    # holds, and then — never having been put into binding mode — drops the
+    # link at the public-key announcement rather than ignoring it. Silence and
+    # a dead link are the same refusal here, so both have to name the buttons;
+    # a `TransportError` that escaped the pump untouched reached the user as a
+    # bare "device disconnected" with no idea what to do about it.
+    known_id = miauth.generate_device_id()
+
+    class BoundDevice(FakeDevice):
+        def __init__(self) -> None:
+            super().__init__()
+            self.link: FakeLink | None = None
+
+        def handle_control(self, payload: bytes) -> None:
+            if payload.hex() == "a2000000":
+                self.phase = "offered"
+                self.data(bytes.fromhex("000000000200"))  # already activated
+                return
+            super().handle_control(payload)
+
+        def handle_data(self, payload: bytes) -> None:
+            if payload == READY and self.phase == "offered":
+                for chunk in miauth.chunks(bytes(4) + known_id):
+                    self.data(chunk)
+                return
+            if payload == bytes.fromhex("000000030400"):
+                assert self.link is not None
+                self.link.disconnect()
+                return
+            super().handle_data(payload)
+
+    device = BoundDevice()
+    link = FakeLink(device)
+    device.link = link
+    auth = MiAuth(link)  # ty: ignore[invalid-argument-type]
+    await auth.open()
+    async with asyncio.timeout(1):
+        with pytest.raises(TransportError, match="device disconnected") as raised:
+            await auth.register(timeout=5.0)
+    assert "both buttons" in str(raised.value)
+
+
+async def test_a_dropped_link_during_login_does_not_name_the_buttons() -> None:
+    # Login carries no hint, so a disconnect there must surface exactly as the
+    # transport phrased it. Pinned as an equality for the same reason the login
+    # timeout is: a weakened guard would append the literal "; None" instead.
+    link = FakeLink(SilentDevice())
+    auth = MiAuth(link)  # ty: ignore[invalid-argument-type]
+    await auth.open()
+    link.disconnect()
+    async with asyncio.timeout(1):
+        with pytest.raises(TransportError) as raised:
+            await auth.login(bytes(12), timeout=5.0)
+    assert str(raised.value) == "device disconnected"
+
+
+async def test_a_silence_that_outlasts_a_disconnect_poll_still_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression test for `FakeLink` itself: `Link.take`'s disconnect poll
+    # (above) reads `self._client.is_connected` once a wait outlasts
+    # `DISCONNECT_POLL` with nothing else settled, which `FakeLink` did not
+    # provide until `FakeGATTClient` was added. Every other silent-device test
+    # here keeps its pump timeout well under the real `DISCONNECT_POLL`, so
+    # none of them reached that branch through `MiAuth` — masking an
+    # `AttributeError` that this longer, lowered-interval silence would
+    # otherwise have hit instead of the ordinary timeout below.
+    monkeypatch.setattr(transport, "DISCONNECT_POLL", 0.01)
+    auth = MiAuth(FakeLink(SilentDevice()))  # ty: ignore[invalid-argument-type]
+    await auth.open()
+    async with asyncio.timeout(1):
+        with pytest.raises(ActivationError, match="did not respond") as raised:
+            await auth.register(timeout=0.05)
+    assert "both buttons" in str(raised.value)
 
 
 async def test_login_without_open_is_an_error() -> None:

@@ -286,6 +286,13 @@ class Session:
         so each request begins by discarding stale queued replies — the
         protocol carries no correlation, and a leftover with the right opcode
         would otherwise pass for this command's answer.
+
+        `RESEND_INTERVAL` covers the write as well as the wait, so that it is
+        the whole budget for an attempt rather than only the listening half. A
+        write that hangs is exactly the case resending exists for, and one left
+        outside this scope would hold up the resend it should be triggering —
+        `transport.WRITE_TIMEOUT` is the backstop for callers with no cadence
+        of their own, not a substitute for keeping to this one.
         """
         if self.queue is None:
             msg = "Session.open() must be called before issuing commands"
@@ -298,9 +305,9 @@ class Session:
         try:
             async with asyncio.timeout(timeout):
                 while True:
-                    await self.link.write(CUSTOM_CHAR, message)
                     try:
                         async with asyncio.timeout(RESEND_INTERVAL):
+                            await self.link.write(CUSTOM_CHAR, message)
                             while True:
                                 response = await self.link.take(self.queue)
                                 # Unrelated notifications, such as streamed

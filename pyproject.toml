@@ -53,6 +53,15 @@ build-backend = "uv_build"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# tests/conftest.py's fakes are shared across test modules via a plain
+# `from conftest import FakeGATTClient`, which only resolves because pytest's
+# default `--import-mode=prepend` puts `tests/` on `sys.path`. That default is
+# not pinned anywhere else in this file, and `--import-mode=importlib` (a
+# standard, increasingly-recommended pytest mode) does not add `tests/` to
+# `sys.path` at all, so the same import fails collection outright under it.
+# Pinning the directory here keeps the import working regardless of which
+# import mode is in effect.
+pythonpath = ["tests"]
 
 [tool.coverage.run]
 source = ["src/mjwsd05ctl"]

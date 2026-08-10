@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from conftest import FakeGATTClient
 
 from mjwsd05ctl import config, transport
 from mjwsd05ctl.constants import CONFIG_VERSION, AdvertisingType, CommandId, ScreenType
@@ -221,6 +222,7 @@ class FakeLink:
         self.duplicate_replies = False
         self.scripted: list[bytes] | None = None
         self._disconnected = asyncio.Event()
+        self._client = FakeGATTClient(self._disconnected)
         self.mac_reply = mac_reply
         self._present = has_characteristic
         # Simulates a device with no Xiaomi bind key stored: BKEY replies come
@@ -368,6 +370,66 @@ async def test_a_disconnect_fails_a_request_immediately() -> None:
     async with asyncio.timeout(1):
         with pytest.raises(TransportError, match="device disconnected"):
             await ses.request(CommandId.CFG, timeout=5.0)
+
+
+def test_a_write_can_never_outlast_a_whole_request() -> None:
+    # request() now issues its write inside the per-attempt RESEND_INTERVAL,
+    # which bounds it well below either of these, so this is a backstop rather
+    # than the mechanism: whatever the nesting, a single unacknowledged write
+    # must not be able to consume a whole request's deadline and leave nothing
+    # for a resend.
+    assert transport.WRITE_TIMEOUT < config.RESPONSE_TIMEOUT
+
+
+def test_the_resend_interval_always_beats_the_write_timeout() -> None:
+    # The write now sits inside `asyncio.timeout(RESEND_INTERVAL)`, so a hung
+    # write is resent, rather than reported as transport.WRITE_TIMEOUT's own
+    # "not acknowledged" TransportError, only as long as RESEND_INTERVAL's
+    # deadline always fires first. Nothing else pins this: the sibling
+    # assertion above compares WRITE_TIMEOUT against RESPONSE_TIMEOUT (the
+    # *outer*, whole-command deadline), not RESEND_INTERVAL (the *inner*,
+    # per-attempt one the write actually runs inside); and no existing test
+    # drives a real transport.Link (with its own WRITE_TIMEOUT) through
+    # Session.request, since request()'s own tests use a FakeLink whose write()
+    # never hangs through transport.Link at all. Invert this relationship —
+    # confirmed by hand with a real transport.Link wrapping a write that never
+    # answers — and a hung write instead raises transport.WRITE_TIMEOUT's
+    # TransportError, which request()'s `except TimeoutError` does not catch,
+    # aborting the whole command after a single attempt instead of resending.
+    assert config.RESEND_INTERVAL < transport.WRITE_TIMEOUT
+
+
+async def test_a_write_that_hangs_is_resent_rather_than_waited_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A write that never completes is precisely what resending exists for, and
+    # for a long time it was the one thing that could not trigger one: the
+    # write sat outside the per-attempt deadline, so it held up the very resend
+    # it should have caused. The command still has to succeed on the retry.
+    monkeypatch.setattr(config, "RESEND_INTERVAL", 0.02)
+
+    class HangsOnTheFirstWrite(FakeLink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hung = False
+
+        async def write(
+            self, uuid: str, data: bytes, *, response: bool | None = None
+        ) -> None:
+            if not self.hung:
+                self.hung = True
+                await asyncio.Event().wait()  # never acknowledged
+            await super().write(uuid, data, response=response)
+
+    link = HangsOnTheFirstWrite()
+    ses = config.Session(link)  # ty: ignore[invalid-argument-type]
+    await ses.open()
+    async with asyncio.timeout(1):
+        cfg = await ses.read_config()
+    assert cfg.advertising_interval == 32
+    # The hung attempt is not in `writes` — it never got that far — so a resend
+    # having happened at all is what this asserts.
+    assert link.writes == [bytes([CommandId.CFG])]
 
 
 async def test_writing_the_config_sends_no_version_byte() -> None:
@@ -698,6 +760,26 @@ async def test_opening_without_the_characteristic_explains_why() -> None:
 
 
 async def test_a_silent_device_times_out_rather_than_hanging() -> None:
+    ses, link = await session()
+    link.silent = True
+    with pytest.raises(ConfigError, match="did not answer"):
+        await ses.request(CommandId.CFG, timeout=0.05)
+
+
+async def test_a_silence_that_outlasts_a_disconnect_poll_still_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression test for `FakeLink` itself: `Link.take`'s disconnect poll
+    # reads `self._client.is_connected` once a wait outlasts `DISCONNECT_POLL`
+    # with nothing else settled, which `FakeLink` did not provide until
+    # `FakeGATTClient` was added. The real `RESEND_INTERVAL` (2s) already
+    # outlasts the real `DISCONNECT_POLL` (1s), so a genuinely slow-but-
+    # connected device hits that branch on every resend in production; every
+    # other silent-device test here keeps its overall timeout under a second,
+    # so none of them reached it — masking an `AttributeError` that this
+    # lowered-interval silence would otherwise have hit instead of the
+    # ordinary timeout below.
+    monkeypatch.setattr(transport, "DISCONNECT_POLL", 0.01)
     ses, link = await session()
     link.silent = True
     with pytest.raises(ConfigError, match="did not answer"):
