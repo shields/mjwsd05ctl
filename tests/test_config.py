@@ -402,11 +402,17 @@ def test_the_resend_interval_always_beats_the_write_timeout() -> None:
 async def test_a_write_that_hangs_is_resent_rather_than_waited_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A write that never completes is precisely what resending exists for, and
-    # for a long time it was the one thing that could not trigger one: the
-    # write sat outside the per-attempt deadline, so it held up the very resend
-    # it should have caused. The command still has to succeed on the retry.
-    monkeypatch.setattr(config, "RESEND_INTERVAL", 0.02)
+    real_timeout = asyncio.timeout
+    resend_deadline: asyncio.Timeout | None = None
+
+    def controlled_timeout(delay: float | None) -> asyncio.Timeout:
+        nonlocal resend_deadline
+        if delay == config.RESEND_INTERVAL:
+            resend_deadline = real_timeout(None)
+            return resend_deadline
+        return real_timeout(delay)
+
+    monkeypatch.setattr(asyncio, "timeout", controlled_timeout)
 
     class HangsOnTheFirstWrite(FakeLink):
         def __init__(self) -> None:
@@ -418,17 +424,16 @@ async def test_a_write_that_hangs_is_resent_rather_than_waited_out(
         ) -> None:
             if not self.hung:
                 self.hung = True
-                await asyncio.Event().wait()  # never acknowledged
+                assert resend_deadline is not None
+                resend_deadline.reschedule(asyncio.get_running_loop().time())
+                await asyncio.Event().wait()
             await super().write(uuid, data, response=response)
 
     link = HangsOnTheFirstWrite()
     ses = config.Session(link)  # ty: ignore[invalid-argument-type]
     await ses.open()
-    async with asyncio.timeout(1):
-        cfg = await ses.read_config()
+    cfg = await ses.read_config()
     assert cfg.advertising_interval == 32
-    # The hung attempt is not in `writes` — it never got that far — so a resend
-    # having happened at all is what this asserts.
     assert link.writes == [bytes([CommandId.CFG])]
 
 

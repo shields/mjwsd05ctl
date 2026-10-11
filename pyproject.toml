@@ -17,7 +17,7 @@ name = "mjwsd05ctl"
 version = "0.1.0"
 description = "Browser-free CLI to activate, flash, configure, and read the Xiaomi MJWSD05MMC thermometer"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.15"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Michael Shields", email = "shields@msrl.com" }]
