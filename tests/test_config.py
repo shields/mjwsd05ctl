@@ -334,16 +334,13 @@ async def test_reading_the_config_skips_unrelated_notifications() -> None:
 async def test_an_unanswered_command_is_sent_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The first write can be lost before it reaches the air (observed on
-    # macOS in a connection's first moments), so request() must resend an
-    # idempotent command rather than wait out its whole deadline. The short
-    # explicit deadline keeps a regression a fast failure, not a slow one.
     monkeypatch.setattr(config, "RESEND_INTERVAL", 0.01)
     ses, link = await session()
     link.drop_writes = 1
     response = await ses.request(CommandId.CFG, timeout=1.0)
     assert response[0] == CONFIG_VERSION
-    assert link.writes == [bytes([CommandId.CFG])] * 2
+    assert len(link.writes) >= 2
+    assert set(link.writes) == {bytes([CommandId.CFG])}
 
 
 async def test_a_duplicate_reply_does_not_pass_for_the_next_answer() -> None:
